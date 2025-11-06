@@ -1,0 +1,15 @@
+% program   : RTKPOST-EX 2.5.0
+% inp file  : Y:\aae4203\rinex data\20250527_PolyU_X.obs
+% inp file  : Y:\aae4203\rinex data\20250527_PolyU_X.nav
+% obs start : 2025/10/27 02:14:47.0 GPST (week2390  94487.0s)
+% obs end   : 2025/10/27 02:18:36.7 GPST (week2390  94716.7s)
+% pos mode  : Single
+% elev mask : 15.0 deg
+% tidecorr  :
+% ionos opt : Broadcast
+% tropo opt : Saastamoinen
+% ephemeris : Broadcast
+% navi sys  : GPS GLONASS Galileo QZSS BDS
+%
+% (lat/lon/height=WGS84/ellipsoidal,Q=1:fix,2:float,3:sbas,4:dgps,5:single,6:ppp,ns=# of satellites)
+%  GPST                  latitude(deg) longitude(deg)  height(m)   Q  ns   sdn(m)   sde(m)   sdu(m)  sdne(m)  sdeu(m)  sdun(m) age(s)  ratio
