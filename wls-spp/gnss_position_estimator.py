@@ -18,6 +18,10 @@ Outputs:
 
 import math
 import numpy as np
+# 新增绘图库
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (仅用于注册 3D 投影)
+from matplotlib.ticker import FormatStrFormatter
 
 # ---------------------- WGS-84 constants ----------------------
 WGS84_A = 6378137.0
@@ -226,6 +230,71 @@ def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4):
 
     return (xr[0], xr[1], xr[2], cb), H_last, idx.size, success
 
+# 新增：生成 2D 经纬度轨迹与 3D ENU 轨迹图
+def generate_and_save_plots(results, out_path):
+    """
+    results: 每 epoch 的结果列表
+    out_path: 原 CSV 输出路径，用于衍生图片文件名
+    """
+    # 提取有效点 (lat_deg idx=4, lon_deg idx=5, h idx=6, x y z idx=1..3)
+    valid = [r for r in results if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
+    if len(valid) < 2:
+        return  # 点太少不绘图
+
+    lats = np.array([r[4] for r in valid])
+    lons = np.array([r[5] for r in valid])
+    hs   = np.array([r[6] for r in valid])
+    xyz  = np.array([[r[1], r[2], r[3]] for r in valid])
+
+    # 选取第一个有效点作为 ENU 参考
+    ref_lat = lats[0]; ref_lon = lons[0]; ref_h = hs[0]
+    ref_xyz = xyz[0]
+    R = ecef_to_enu_rotation(ref_lat, ref_lon)
+
+    enu = (R @ (xyz - ref_xyz).T).T  # (N,3) -> (e,n,u)
+
+    prefix = out_path.rsplit(".", 1)[0]
+    plot2d = prefix + "_track_2d.png"
+    plot3d = prefix + "_track_enu_3d.png"
+
+    # 2D 经纬度
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(lons, lats, 'k.-', linewidth=1, markersize=3)
+    ax.set_xlabel("Longitude (deg)")
+    ax.set_ylabel("Latitude (deg)")
+    ax.set_title("Geographic Track (Lon-Lat)")
+    ax.grid(alpha=0.4)
+    # 以小数显示经纬度（禁用科学计数法与偏移）
+    ax.xaxis.set_major_formatter(FormatStrFormatter('%.6f'))
+    ax.yaxis.set_major_formatter(FormatStrFormatter('%.6f'))
+    fig.tight_layout()
+    fig.savefig(plot2d, dpi=150)
+    plt.show()
+    plt.close(fig)
+
+    # 3D ENU
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.plot(enu[:, 0], enu[:, 1], enu[:, 2], 'r.-', linewidth=1, markersize=3)
+    ax.set_xlabel("E (m)")
+    ax.set_ylabel("N (m)")
+    ax.set_zlabel("U (m)")
+    ax.set_title("Track in ENU Frame (Ref = first valid point)")
+    # 自适应立方体比例
+    ranges = [enu[:, i].max() - enu[:, i].min() for i in range(3)]
+    max_range = max(ranges)
+    centers = [ (enu[:, i].max() + enu[:, i].min())/2.0 for i in range(3)]
+    for i, (low, high) in enumerate([(c - max_range/2, c + max_range/2) for c in centers]):
+        if i == 0: ax.set_xlim(low, high)
+        if i == 1: ax.set_ylim(low, high)
+        if i == 2: ax.set_zlim(low, high)
+    plt.tight_layout()
+    plt.savefig(plot3d, dpi=150)
+    plt.show()
+    plt.close()
+
+    print(f"Saved {plot2d} and {plot3d}.")
+
 def main():
     # 直接在此处指定输入/输出文件路径，替换为你的实际路径
     pseudoranges = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/pseudoranges_meas.csv"
@@ -234,7 +303,7 @@ def main():
     trop         = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/tropospheric_delay.csv"
     sat_pos      = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/satellite_positions.csv"
     out_path     = "/Users/jay/Documents/Bachelor/aae4203/Result/lse_solution.csv"
-    kml_out      = out_path.rsplit(".", 1)[0] + ".kml"  # 基于 CSV 路径生成 KML
+    kml_out      = "/Users/jay/Documents/Bachelor/aae4203/Result/lse_solution.kml"  # 基于 CSV 路径生成 KML
 
     # 可选初值（如果需要），否则置 None
     llh0 = None  # e.g. "22.304139 114.180131 -20.2" -> set below if needed
@@ -311,6 +380,8 @@ def main():
     if coords:
         save_kml(coords, kml_out, name="LS SPP Solution")
         print(f"Saved {kml_out} with {len(coords)} points.")
+    # 新增：绘图调用
+    generate_and_save_plots(results, out_path)
 
 if __name__ == "__main__":
     main()
