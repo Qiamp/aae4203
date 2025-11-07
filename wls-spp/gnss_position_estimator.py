@@ -133,6 +133,35 @@ def compute_dops(H, lat_deg, lon_deg):
     PDOP = math.sqrt(var_e + var_n + var_u)
     return PDOP, HDOP, VDOP
 
+# 新增：将经纬高序列写出为 KML（LineString）
+def save_kml(coords_lon_lat_h, path, name="SPP Solution"):
+    """
+    coords_lon_lat_h: list of (lon_deg, lat_deg, h_m)
+    path: output .kml filepath
+    """
+    lines = []
+    lines.append('<?xml version="1.0" encoding="UTF-8"?>')
+    lines.append('<kml xmlns="http://www.opengis.net/kml/2.2">')
+    lines.append('<Document>')
+    lines.append(f'  <name>{name}</name>')
+    lines.append('  <Style id="trk"><LineStyle><color>ff00ff00</color><width>3</width></LineStyle></Style>')
+    lines.append('  <Placemark>')
+    lines.append('    <name>Track</name>')
+    lines.append('    <styleUrl>#trk</styleUrl>')
+    lines.append('    <LineString>')
+    lines.append('      <tessellate>1</tessellate>')
+    lines.append('      <altitudeMode>absolute</altitudeMode>')
+    lines.append('      <coordinates>')
+    for lon, lat, h in coords_lon_lat_h:
+        lines.append(f'        {lon:.9f},{lat:.9f},{h:.3f}')
+    lines.append('      </coordinates>')
+    lines.append('    </LineString>')
+    lines.append('  </Placemark>')
+    lines.append('</Document>')
+    lines.append('</kml>')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
 def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4):
     """
     p_corr: (m,) corrected pseudoranges (P + clk_s - ion - trop)
@@ -204,7 +233,8 @@ def main():
     ion          = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/ionospheric_delay.csv"
     trop         = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/tropospheric_delay.csv"
     sat_pos      = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/satellite_positions.csv"
-    out_path     = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/lse_solution.csv"
+    out_path     = "/Users/jay/Documents/Bachelor/aae4203/Result/lse_solution.csv"
+    kml_out      = out_path.rsplit(".", 1)[0] + ".kml"  # 基于 CSV 路径生成 KML
 
     # 可选初值（如果需要），否则置 None
     llh0 = None  # e.g. "22.304139 114.180131 -20.2" -> set below if needed
@@ -213,7 +243,7 @@ def main():
     max_iter = 20
     tol = 1e-4
 
-    # 读取文件（与原来行为一致）
+    # 读取文件
     P = load_csv(pseudoranges)          # (Smax, E)
     CLK = load_csv(sat_clk)             # (Smax, E)
     ION = load_csv(ion)                 # (Smax, E)
@@ -274,6 +304,13 @@ def main():
     out = np.array(results, dtype=float)
     np.savetxt(out_path, out, delimiter=",", header=header, comments="", fmt="%.10f")
     print(f"Saved {out_path} with {out.shape[0]} epochs.")
+
+    # 生成并保存 KML（过滤无效 LLH）
+    coords = [(r[5], r[4], r[6]) for r in results
+              if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
+    if coords:
+        save_kml(coords, kml_out, name="LS SPP Solution")
+        print(f"Saved {kml_out} with {len(coords)} points.")
 
 if __name__ == "__main__":
     main()
