@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (仅用于注册 3D 投影)
 from matplotlib.ticker import FormatStrFormatter
 import io
+import pandas as pd
 
 # ---------------------- WGS-84 constants ----------------------
 WGS84_A = 6378137.0
@@ -253,7 +254,72 @@ def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4):
 
     return (xr[0], xr[1], xr[2], cb), H_last, idx.size, success
 
-# 新增：生成 2D 经纬度轨迹与 3D ENU 轨迹图
+# 新增：误差分析计算函数
+def compute_error_statistics(ls_xyz, truth_xyz, ref_lat, ref_lon):
+    """
+    计算 LS 解相对于真值的误差统计（ENU坐标系）
+    
+    参数:
+        ls_xyz: (N, 3) LS解的ECEF坐标
+        truth_xyz: (N, 3) 真值的ECEF坐标
+        ref_lat, ref_lon: 参考点纬度经度（度）
+    
+    返回:
+        dict 包含:
+            'e_err', 'n_err', 'u_err': (N,) 各方向误差
+            'err_2d', 'err_3d': (N,) 2D和3D误差
+            'stats': 统计量字典
+    """
+    # 转换到ENU
+    R = ecef_to_enu_rotation(ref_lat, ref_lon)
+    ref_xyz = truth_xyz[0]  # 使用第一个真值点作为参考
+    
+    ls_enu = (R @ (ls_xyz - ref_xyz).T).T
+    truth_enu = (R @ (truth_xyz - ref_xyz).T).T
+    
+    # 计算各方向误差
+    delta = ls_enu - truth_enu
+    e_err = delta[:, 0]
+    n_err = delta[:, 1]
+    u_err = delta[:, 2]
+    
+    # 2D和3D误差
+    err_2d = np.sqrt(e_err**2 + n_err**2)
+    err_3d = np.linalg.norm(delta, axis=1)
+    
+    # 统计量
+    valid_mask = np.isfinite(err_3d)
+    if valid_mask.sum() > 0:
+        stats = {
+            'e_mean': np.mean(e_err[valid_mask]),
+            'e_std': np.std(e_err[valid_mask]),
+            'e_rms': np.sqrt(np.mean(e_err[valid_mask]**2)),
+            'n_mean': np.mean(n_err[valid_mask]),
+            'n_std': np.std(n_err[valid_mask]),
+            'n_rms': np.sqrt(np.mean(n_err[valid_mask]**2)),
+            'u_mean': np.mean(u_err[valid_mask]),
+            'u_std': np.std(u_err[valid_mask]),
+            'u_rms': np.sqrt(np.mean(u_err[valid_mask]**2)),
+            '2d_mean': np.mean(err_2d[valid_mask]),
+            '2d_std': np.std(err_2d[valid_mask]),
+            '2d_rms': np.sqrt(np.mean(err_2d[valid_mask]**2)),
+            '3d_mean': np.mean(err_3d[valid_mask]),
+            '3d_std': np.std(err_3d[valid_mask]),
+            '3d_rms': np.sqrt(np.mean(err_3d[valid_mask]**2)),
+        }
+    else:
+        stats = {}
+    
+    return {
+        'e_err': e_err,
+        'n_err': n_err,
+        'u_err': u_err,
+        'err_2d': err_2d,
+        'err_3d': err_3d,
+        'stats': stats
+    }
+
+# 修改：增强的绘图函数，包含误差分析
 def generate_and_save_plots(results, out_path, truth_llh=None):
     valid = [r for r in results if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
     if len(valid) < 1:
@@ -264,6 +330,7 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
     lons = np.array([r[5] for r in valid])
     hs   = np.array([r[6] for r in valid])
     xyz  = np.array([[r[1], r[2], r[3]] for r in valid])
+    epochs = np.array([r[0] for r in valid])
 
     # 参考点
     ref_lat, ref_lon, ref_h = lats[0], lons[0], hs[0]
@@ -273,6 +340,7 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
 
     # 真值（来自 NAV-PVT）
     t_lon = t_lat = t_h = t_enu = None
+    error_data = None
     if truth_llh is not None and len(truth_llh) >= 1:
         t_lon = np.asarray(truth_llh[:,0], float)
         t_lat = np.asarray(truth_llh[:,1], float)
@@ -280,10 +348,23 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
         t_xyz = np.array([lla_to_ecef(t_lat[i], t_lon[i], t_h[i]) for i in range(len(t_lon))])
         n = min(len(lons), len(t_lon))  # 按索引对齐
         lons, lats, hs, xyz, enu = lons[:n], lats[:n], hs[:n], xyz[:n], enu[:n]
+        epochs = epochs[:n]
         t_lon, t_lat, t_h = t_lon[:n], t_lat[:n], t_h[:n]
         t_xyz = t_xyz[:n]
         t_enu = (R @ (t_xyz - ref_xyz).T).T
+        
+        # 计算误差统计
+        error_data = compute_error_statistics(xyz, t_xyz, ref_lat, ref_lon)
+        
         print(f"[Plot] LS points: {len(lats)}, Truth(NAV-PVT) points: {len(t_lon)} (aligned by index).")
+        if error_data['stats']:
+            st = error_data['stats']
+            print(f"[Error Stats]")
+            print(f"  East  - Mean: {st['e_mean']:7.3f} m, Std: {st['e_std']:6.3f} m, RMS: {st['e_rms']:6.3f} m")
+            print(f"  North - Mean: {st['n_mean']:7.3f} m, Std: {st['n_std']:6.3f} m, RMS: {st['n_rms']:6.3f} m")
+            print(f"  Up    - Mean: {st['u_mean']:7.3f} m, Std: {st['u_std']:6.3f} m, RMS: {st['u_rms']:6.3f} m")
+            print(f"  2D    - Mean: {st['2d_mean']:7.3f} m, Std: {st['2d_std']:6.3f} m, RMS: {st['2d_rms']:6.3f} m")
+            print(f"  3D    - Mean: {st['3d_mean']:7.3f} m, Std: {st['3d_std']:6.3f} m, RMS: {st['3d_rms']:6.3f} m")
 
     prefix = out_path.rsplit(".", 1)[0]
     plot2d = prefix + "_track_2d.png"
@@ -325,6 +406,125 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
         if i == 2: ax.set_zlim(low, high)
     ax.legend(); plt.tight_layout(); plt.savefig(plot3d, dpi=150); plt.show(); plt.close()
     print(f"Saved {plot2d} and {plot3d}.")
+    
+    # 新增：误差分析图
+    if error_data is not None:
+        # 1. ENU误差时间序列
+        plot_enu_err = prefix + "_error_enu_timeseries.png"
+        fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+        
+        axes[0].plot(epochs, error_data['e_err'], 'b.-', linewidth=0.8, markersize=2)
+        axes[0].axhline(0, color='k', linestyle='--', linewidth=0.5)
+        axes[0].set_ylabel('East Error (m)')
+        axes[0].grid(alpha=0.3)
+        axes[0].set_title('Position Errors in ENU Frame')
+        
+        axes[1].plot(epochs, error_data['n_err'], 'g.-', linewidth=0.8, markersize=2)
+        axes[1].axhline(0, color='k', linestyle='--', linewidth=0.5)
+        axes[1].set_ylabel('North Error (m)')
+        axes[1].grid(alpha=0.3)
+        
+        axes[2].plot(epochs, error_data['u_err'], 'r.-', linewidth=0.8, markersize=2)
+        axes[2].axhline(0, color='k', linestyle='--', linewidth=0.5)
+        axes[2].set_ylabel('Up Error (m)')
+        axes[2].set_xlabel('Epoch')
+        axes[2].grid(alpha=0.3)
+        
+        fig.tight_layout()
+        fig.savefig(plot_enu_err, dpi=150)
+        plt.show()
+        plt.close(fig)
+        print(f"Saved {plot_enu_err}.")
+        
+        # 2. 2D/3D误差时间序列
+        plot_2d3d_err = prefix + "_error_2d3d_timeseries.png"
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+        
+        axes[0].plot(epochs, error_data['err_2d'], 'm.-', linewidth=0.8, markersize=2)
+        axes[0].set_ylabel('2D Error (m)')
+        axes[0].grid(alpha=0.3)
+        axes[0].set_title('2D and 3D Position Errors')
+        
+        axes[1].plot(epochs, error_data['err_3d'], 'c.-', linewidth=0.8, markersize=2)
+        axes[1].set_ylabel('3D Error (m)')
+        axes[1].set_xlabel('Epoch')
+        axes[1].grid(alpha=0.3)
+        
+        fig.tight_layout()
+        fig.savefig(plot_2d3d_err, dpi=150)
+        plt.show()
+        plt.close(fig)
+        print(f"Saved {plot_2d3d_err}.")
+        
+        # 3. 误差分布直方图
+        plot_hist = prefix + "_error_histogram.png"
+        fig, axes = plt.subplots(2, 3, figsize=(12, 7))
+        
+        # E/N/U误差分布
+        for idx, (err, name, color) in enumerate([
+            (error_data['e_err'], 'East', 'blue'),
+            (error_data['n_err'], 'North', 'green'),
+            (error_data['u_err'], 'Up', 'red')
+        ]):
+            valid = err[np.isfinite(err)]
+            axes[0, idx].hist(valid, bins=30, color=color, alpha=0.7, edgecolor='black')
+            axes[0, idx].axvline(0, color='k', linestyle='--', linewidth=1)
+            axes[0, idx].set_xlabel(f'{name} Error (m)')
+            axes[0, idx].set_ylabel('Count')
+            axes[0, idx].set_title(f'{name} Error Distribution')
+            axes[0, idx].grid(alpha=0.3)
+        
+        # 2D/3D误差分布
+        for idx, (err, name, color) in enumerate([
+            (error_data['err_2d'], '2D', 'magenta'),
+            (error_data['err_3d'], '3D', 'cyan')
+        ]):
+            valid = err[np.isfinite(err)]
+            axes[1, idx].hist(valid, bins=30, color=color, alpha=0.7, edgecolor='black')
+            axes[1, idx].set_xlabel(f'{name} Error (m)')
+            axes[1, idx].set_ylabel('Count')
+            axes[1, idx].set_title(f'{name} Error Distribution')
+            axes[1, idx].grid(alpha=0.3)
+        
+        # 隐藏空白子图
+        axes[1, 2].axis('off')
+        
+        fig.tight_layout()
+        fig.savefig(plot_hist, dpi=150)
+        plt.show()
+        plt.close(fig)
+        print(f"Saved {plot_hist}.")
+        
+        # 4. 误差统计汇总图
+        if error_data['stats']:
+            plot_stats = prefix + "_error_statistics.png"
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            components = ['East', 'North', 'Up', '2D', '3D']
+            means = [error_data['stats'][f'{k}_mean'] for k in ['e', 'n', 'u', '2d', '3d']]
+            stds = [error_data['stats'][f'{k}_std'] for k in ['e', 'n', 'u', '2d', '3d']]
+            rms = [error_data['stats'][f'{k}_rms'] for k in ['e', 'n', 'u', '2d', '3d']]
+            
+            x = np.arange(len(components))
+            width = 0.25
+            
+            ax.bar(x - width, means, width, label='Mean', color='skyblue', edgecolor='black')
+            ax.bar(x, stds, width, label='Std Dev', color='lightcoral', edgecolor='black')
+            ax.bar(x + width, rms, width, label='RMS', color='lightgreen', edgecolor='black')
+            
+            ax.set_xlabel('Component')
+            ax.set_ylabel('Error (m)')
+            ax.set_title('Error Statistics Summary')
+            ax.set_xticks(x)
+            ax.set_xticklabels(components)
+            ax.legend()
+            ax.grid(alpha=0.3, axis='y')
+            
+            fig.tight_layout()
+            fig.savefig(plot_stats, dpi=150)
+            plt.show()
+            plt.close(fig)
+            print(f"Saved {plot_stats}.")
 
 
 def load_truth_llh_from_nav_pvt(path):
@@ -374,6 +574,101 @@ def load_truth_llh_from_nav_pvt(path):
     return np.column_stack([lon, lat, h])
 
 
+def print_summary_table(results, error_data, truth_llh):
+    """
+    打印格式化的统计摘要表格，类似于图像中的格式
+    """
+    # 统计有效历元数
+    valid_results = [r for r in results if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
+    total_epochs = len(valid_results)
+    
+    print("\n" + "="*80)
+    print("GNSS SPP POSITIONING RESULTS SUMMARY".center(80))
+    print("="*80)
+    print(f"\nTotal Epochs Processed: {total_epochs}")
+    print("="*80)
+    
+    # 定位精度统计
+    if error_data is not None and error_data['stats']:
+        st = error_data['stats']
+        print("\nPOSITIONING ACCURACY STATISTICS".center(80))
+        print("="*80)
+        print(f"{'Metric':<25} {'2D Error (m)':<20} {'3D Error (m)':<20}")
+        print("-" * 80)
+        print(f"{'Mean':<25} {st['2d_mean']:>18.3f}  {st['3d_mean']:>18.3f}")
+        print(f"{'RMS':<25} {st['2d_rms']:>18.3f}  {st['3d_rms']:>18.3f}")
+        print(f"{'Standard Deviation':<25} {st['2d_std']:>18.3f}  {st['3d_std']:>18.3f}")
+        
+        # 计算最大值、最小值和95百分位
+        valid_2d = error_data['err_2d'][np.isfinite(error_data['err_2d'])]
+        valid_3d = error_data['err_3d'][np.isfinite(error_data['err_3d'])]
+        
+        if len(valid_2d) > 0 and len(valid_3d) > 0:
+            max_2d = np.max(valid_2d)
+            min_2d = np.min(valid_2d)
+            p95_2d = np.percentile(valid_2d, 95)
+            
+            max_3d = np.max(valid_3d)
+            min_3d = np.min(valid_3d)
+            p95_3d = np.percentile(valid_3d, 95)
+            
+            print(f"{'Maximum':<25} {max_2d:>18.3f}  {max_3d:>18.3f}")
+            print(f"{'Minimum':<25} {min_2d:>18.3f}  {min_3d:>18.3f}")
+            print(f"{'95th Percentile':<25} {p95_2d:>18.3f}  {p95_3d:>18.3f}")
+    
+    # ENU 分量统计
+    if error_data is not None and error_data['stats']:
+        st = error_data['stats']
+        print("\n" + "="*80)
+        print("ENU COMPONENT ACCURACY".center(80))
+        print("="*80)
+        print(f"{'Component':<15} {'Mean (m)':<15} {'RMS (m)':<15} {'Std Dev (m)':<15}")
+        print("-" * 80)
+        print(f"{'East':<15} {st['e_mean']:>13.3f}  {st['e_rms']:>13.3f}  {st['e_std']:>13.3f}")
+        print(f"{'North':<15} {st['n_mean']:>13.3f}  {st['n_rms']:>13.3f}  {st['n_std']:>13.3f}")
+        print(f"{'Up':<15} {st['u_mean']:>13.3f}  {st['u_rms']:>13.3f}  {st['u_std']:>13.3f}")
+    
+    # 坐标范围
+    if len(valid_results) > 0:
+        lats = np.array([r[4] for r in valid_results])
+        lons = np.array([r[5] for r in valid_results])
+        hs = np.array([r[6] for r in valid_results])
+        
+        print("\n" + "="*80)
+        print("COORDINATE RANGES".center(80))
+        print("="*80)
+        print(f"Latitude Range:  {np.min(lats):.6f}°  to  {np.max(lats):.6f}°")
+        print(f"Longitude Range: {np.min(lons):.6f}°  to  {np.max(lons):.6f}°")
+        print(f"Altitude Range:  {np.min(hs):.3f} m  to  {np.max(hs):.3f} m")
+    
+    # DOP 统计
+    pdops = [r[9] for r in valid_results if np.isfinite(r[9])]
+    hdops = [r[10] for r in valid_results if np.isfinite(r[10])]
+    vdops = [r[11] for r in valid_results if np.isfinite(r[11])]
+    
+    if pdops and hdops and vdops:
+        print("\n" + "="*80)
+        print("DOP STATISTICS".center(80))
+        print("="*80)
+        print(f"{'Metric':<15} {'PDOP':<15} {'HDOP':<15} {'VDOP':<15}")
+        print("-" * 80)
+        print(f"{'Mean':<15} {np.mean(pdops):>13.3f}  {np.mean(hdops):>13.3f}  {np.mean(vdops):>13.3f}")
+        print(f"{'Median':<15} {np.median(pdops):>13.3f}  {np.median(hdops):>13.3f}  {np.median(vdops):>13.3f}")
+        print(f"{'Minimum':<15} {np.min(pdops):>13.3f}  {np.min(hdops):>13.3f}  {np.min(vdops):>13.3f}")
+        print(f"{'Maximum':<15} {np.max(pdops):>13.3f}  {np.max(hdops):>13.3f}  {np.max(vdops):>13.3f}")
+    
+    # 卫星数统计
+    nsats = [int(r[8]) for r in valid_results if np.isfinite(r[8])]
+    if nsats:
+        print("\n" + "="*80)
+        print("SATELLITE VISIBILITY".center(80))
+        print("="*80)
+        print(f"Average Satellites:  {np.mean(nsats):.1f}")
+        print(f"Minimum Satellites:  {np.min(nsats)}")
+        print(f"Maximum Satellites:  {np.max(nsats)}")
+    
+    print("="*80 + "\n")
+
 def main():
     # 直接在此处指定输入/输出文件路径，替换为你的实际路径
     pseudoranges = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/pseudoranges_meas.csv"
@@ -390,7 +685,7 @@ def main():
 
     # 迭代参数
     max_iter = 20
-    tol = 1e-4
+    tol = 1e-7
 
     # 读取文件
     P = load_csv(pseudoranges)          # (Smax, E)
@@ -478,8 +773,178 @@ def main():
         print(f"Saved {kml_out} with LS {len(ls_coords)} pts"
             f"{'' if truth_coords is None else f' and Truth {len(truth_coords)} pts'}.")
 
-    # 新增：绘图调用
+    # 绘图调用（修改为保存error_data）
+    valid = [r for r in results if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
+    error_data = None
+    
+    if len(valid) >= 1 and truth_llh is not None and len(truth_llh) >= 1:
+        lats = np.array([r[4] for r in valid])
+        lons = np.array([r[5] for r in valid])
+        hs = np.array([r[6] for r in valid])
+        xyz = np.array([[r[1], r[2], r[3]] for r in valid])
+        
+        t_lon = np.asarray(truth_llh[:, 0], float)
+        t_lat = np.asarray(truth_llh[:, 1], float)
+        t_h = np.asarray(truth_llh[:, 2], float)
+        t_xyz = np.array([lla_to_ecef(t_lat[i], t_lon[i], t_h[i]) for i in range(len(t_lon))])
+        
+        n = min(len(lons), len(t_lon))
+        xyz = xyz[:n]
+        t_xyz = t_xyz[:n]
+        
+        ref_lat, ref_lon = lats[0], lons[0]
+        error_data = compute_error_statistics(xyz, t_xyz, ref_lat, ref_lon)
+    
     generate_and_save_plots(results, out_path, truth_llh=truth_llh)
+    
+    # 新增：打印统计表格
+    print_summary_table(results, error_data, truth_llh)
+    
+    # 新增：导出误差和DOP数据到CSV
+    error_dop_csv = out_path.rsplit('.', 1)[0] + '_error_dop.csv'
+    save_error_and_dop_statistics(results, error_data, error_dop_csv)
+
+def save_error_and_dop_statistics(results, error_data, out_path):
+    """
+    将误差分析数据和DOP数据保存到独立的CSV文件
+    
+    参数:
+        results: 定位结果列表
+        error_data: 误差分析数据字典
+        out_path: 输出CSV文件路径
+    """
+    valid_results = [r for r in results if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
+    
+    if len(valid_results) == 0:
+        print("[Warning] No valid results to export error/DOP statistics.")
+        return
+    
+    # 准备数据
+    epochs = [r[0] for r in valid_results]
+    nsats = [r[8] for r in valid_results]
+    pdops = [r[9] for r in valid_results]
+    hdops = [r[10] for r in valid_results]
+    vdops = [r[11] for r in valid_results]
+    
+    # 如果有误差数据，添加误差列
+    if error_data is not None:
+        # 对齐长度（误差数据可能比结果少）
+        n = min(len(epochs), len(error_data['e_err']))
+        
+        data_dict = {
+            'epoch': epochs[:n],
+            'nsat': nsats[:n],
+            'PDOP': pdops[:n],
+            'HDOP': hdops[:n],
+            'VDOP': vdops[:n],
+            'east_error_m': error_data['e_err'][:n],
+            'north_error_m': error_data['n_err'][:n],
+            'up_error_m': error_data['u_err'][:n],
+            '2d_error_m': error_data['err_2d'][:n],
+            '3d_error_m': error_data['err_3d'][:n]
+        }
+    else:
+        data_dict = {
+            'epoch': epochs,
+            'nsat': nsats,
+            'PDOP': pdops,
+            'HDOP': hdops,
+            'VDOP': vdops
+        }
+    
+    # 转换为numpy数组并保存
+    df = pd.DataFrame(data_dict)
+    df.to_csv(out_path, index=False, float_format='%.6f')
+    
+    print(f"Saved error and DOP statistics to {out_path}")
+    
+    # 如果有误差统计，保存统计摘要到另一个文件
+    if error_data is not None and error_data['stats']:
+        stats_path = out_path.rsplit('.', 1)[0] + '_summary.csv'
+        
+        stats_data = []
+        st = error_data['stats']
+        
+        # 误差统计
+        for component, prefix in [('East', 'e'), ('North', 'n'), ('Up', 'u'), 
+                                   ('2D', '2d'), ('3D', '3d')]:
+            stats_data.append({
+                'Component': component,
+                'Mean_m': st[f'{prefix}_mean'],
+                'RMS_m': st[f'{prefix}_rms'],
+                'Std_m': st[f'{prefix}_std']
+            })
+        
+        # 添加最大值、最小值、95百分位
+        valid_2d = error_data['err_2d'][np.isfinite(error_data['err_2d'])]
+        valid_3d = error_data['err_3d'][np.isfinite(error_data['err_3d'])]
+        
+        if len(valid_2d) > 0 and len(valid_3d) > 0:
+            stats_data.append({
+                'Component': '2D_max',
+                'Mean_m': np.max(valid_2d),
+                'RMS_m': np.nan,
+                'Std_m': np.nan
+            })
+            stats_data.append({
+                'Component': '2D_min',
+                'Mean_m': np.min(valid_2d),
+                'RMS_m': np.nan,
+                'Std_m': np.nan
+            })
+            stats_data.append({
+                'Component': '2D_95percentile',
+                'Mean_m': np.percentile(valid_2d, 95),
+                'RMS_m': np.nan,
+                'Std_m': np.nan
+            })
+            stats_data.append({
+                'Component': '3D_max',
+                'Mean_m': np.max(valid_3d),
+                'RMS_m': np.nan,
+                'Std_m': np.nan
+            })
+            stats_data.append({
+                'Component': '3D_min',
+                'Mean_m': np.min(valid_3d),
+                'RMS_m': np.nan,
+                'Std_m': np.nan
+            })
+            stats_data.append({
+                'Component': '3D_95percentile',
+                'Mean_m': np.percentile(valid_3d, 95),
+                'RMS_m': np.nan,
+                'Std_m': np.nan
+            })
+        
+        # DOP统计
+        pdops_valid = [p for p in pdops if np.isfinite(p)]
+        hdops_valid = [h for h in hdops if np.isfinite(h)]
+        vdops_valid = [v for v in vdops if np.isfinite(v)]
+        
+        if pdops_valid and hdops_valid and vdops_valid:
+            stats_data.append({
+                'Component': 'PDOP_mean',
+                'Mean_m': np.mean(pdops_valid),
+                'RMS_m': np.median(pdops_valid),
+                'Std_m': np.std(pdops_valid)
+            })
+            stats_data.append({
+                'Component': 'HDOP_mean',
+                'Mean_m': np.mean(hdops_valid),
+                'RMS_m': np.median(hdops_valid),
+                'Std_m': np.std(hdops_valid)
+            })
+            stats_data.append({
+                'Component': 'VDOP_mean',
+                'Mean_m': np.mean(vdops_valid),
+                'RMS_m': np.median(vdops_valid),
+                'Std_m': np.std(vdops_valid)
+            })
+        
+        df_stats = pd.DataFrame(stats_data)
+        df_stats.to_csv(stats_path, index=False, float_format='%.6f')
+        print(f"Saved summary statistics to {stats_path}")
 
 if __name__ == "__main__":
     main()
