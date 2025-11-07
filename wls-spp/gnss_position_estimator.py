@@ -1,382 +1,279 @@
-"""
-WLS GNSS Positioning
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-Expected CSVs:
-  Required:
-    pseudoranges_meas.csv        [max_sats, num_epochs]
-    satellite_clock_bias.csv     [max_sats, num_epochs] (meters or seconds; auto-detect)
-    ionospheric_delay.csv        [max_sats, num_epochs] (meters, L1-equivalent)
-    tropospheric_delay.csv       [max_sats, num_epochs] (meters)
-    satellite_positions.csv      [max_sats, num_epochs*3] (meters; columns per epoch = [Ex,Ey,Ez])
+"""
+Least-Squares SPP from matRTKLIB-exported CSVs.
+
+Inputs (from your MATLAB/matRTKLIB script):
+- pseudoranges_meas.csv          : shape (max_sats, num_epochs), meters
+- satellite_clock_bias.csv       : shape (max_sats, num_epochs), meters (c*dt_s)
+- ionospheric_delay.csv          : shape (max_sats, num_epochs), meters
+- tropospheric_delay.csv         : shape (max_sats, num_epochs), meters
+- satellite_positions.csv        : shape (max_sats, num_epochs*3), ECEF meters
+  (epoch k occupies columns [3k, 3k+1, 3k+2])
 
 Outputs:
-  wls_ecef_clk.csv  -> [x(m), y(m), z(m), dtr(m)]
-  wls_llh.csv       -> [lat(deg), lon(deg), h(m)]
-  wls_iters_ok.csv  -> [iters, ok(1/0)]
-  trajectory.kml    -> KML trajectory file
-  trajectory_2d.png -> 2D geographic view
-  trajectory_3d_enu.png -> 3D ENU frame trajectory
-
-Author: ZHAO Jiaqi
+- lse_solution.csv: per-epoch solution [epoch, xs, ys, zs, lat(deg), lon(deg), h(m), clock_bias_m, nsat, PDOP, HDOP, VDOP]
 """
 
+import math
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import simplekml
 
-# ---------------------------
-# Config
-# ---------------------------
-FILE_PSEUDO = 'rinex_data/pseudoranges_meas.csv'
-FILE_CLK    = 'rinex_data/satellite_clock_bias.csv'
-FILE_IONO   = 'rinex_data/ionospheric_delay.csv'
-FILE_TROPO  = 'rinex_data/tropospheric_delay.csv'
-FILE_POS    = 'rinex_data/satellite_positions.csv'
+# ---------------------- WGS-84 constants ----------------------
+WGS84_A = 6378137.0
+WGS84_F = 1.0/298.257223563
+WGS84_E2 = WGS84_F * (2.0 - WGS84_F)  # first eccentricity squared
 
-MAX_ITERS   = 100
-TOL         = 1e-3    # meters
-MIN_SATS    = 10
-USE_LAST_AS_INIT = True  # use previous epoch as init
-C_MPS       = 299792458.0
+C = 299792458.0  # m/s, speed of light (not directly used since clk bias is in meters)
 
-# If you want to force units instead of auto-detection, set these:
-CLK_UNITS = 'meters'  # None|'seconds'|'meters'
+def load_csv(path):
+    # Robustly load with NaNs; allow empty lines
+    return np.genfromtxt(path, delimiter=',')
 
-# ---------------------------
-# Helpers
-# ---------------------------
+def split_sat_positions_matrix(sat_pos_mat):
+    """
+    sat_pos_mat: (max_sats, num_epochs*3)
+    returns: list of length num_epochs; each is array (max_sats, 3)
+    """
+    max_sats, cols = sat_pos_mat.shape
+    assert cols % 3 == 0, "satellite_positions.csv columns must be multiple of 3"
+    num_epochs = cols // 3
+    per_epoch = []
+    for k in range(num_epochs):
+        sl = slice(3*k, 3*k+3)
+        per_epoch.append(sat_pos_mat[:, sl])
+    return per_epoch
 
-def load_csv_or_none(path):
+def ecef_to_lla(x, y, z):
+    """
+    Convert ECEF (m) to geodetic LLH (deg, deg, m), WGS-84.
+    Iterative method.
+    """
+    a = WGS84_A
+    e2 = WGS84_E2
+    b = a * (1 - WGS84_F)
+
+    r = math.hypot(x, y)
+    if r < 1e-12 and abs(z) < 1e-12:
+        return 0.0, 0.0, -a  # deg,deg,m (arbitrary)
+
+    lon = math.degrees(math.atan2(y, x))
+    # initial lat
+    lat = math.atan2(z, r * (1 - e2))
+    for _ in range(10):
+        sinl = math.sin(lat)
+        N = a / math.sqrt(1.0 - e2 * sinl*sinl)
+        h = r / math.cos(lat) - N
+        lat_new = math.atan2(z, r * (1.0 - e2 * N/(N + h)))
+        if abs(lat_new - lat) < 1e-12:
+            lat = lat_new
+            break
+        lat = lat_new
+    sinl = math.sin(lat)
+    N = a / math.sqrt(1.0 - e2 * sinl*sinl)
+    h = r / math.cos(lat) - N
+    return math.degrees(lat), lon, h
+
+def lla_to_ecef(lat_deg, lon_deg, h):
+    a = WGS84_A
+    e2 = WGS84_E2
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    sinl = math.sin(lat); cosl = math.cos(lat)
+    sinL = math.sin(lon); cosL = math.cos(lon)
+    N = a / math.sqrt(1 - e2*sinl*sinl)
+    x = (N + h) * cosl * cosL
+    y = (N + h) * cosl * sinL
+    z = (N*(1 - e2) + h) * sinl
+    return np.array([x, y, z], dtype=float)
+
+def ecef_to_enu_rotation(lat_deg, lon_deg):
+    """
+    Rotation matrix R such that [e,n,u]^T = R * [x,y,z]^T (ECEF delta).
+    """
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    sl, cl = math.sin(lat), math.cos(lat)
+    sL, cL = math.sin(lon), math.cos(lon)
+    R = np.array([
+        [-sL,            cL,           0.0],
+        [-sl*cL,        -sl*sL,        cl ],
+        [ cl*cL,         cl*sL,        sl ]
+    ], dtype=float)
+    return R
+
+def compute_dops(H, lat_deg, lon_deg):
+    """
+    Compute PDOP/HDOP/VDOP from geometry matrix H (n x 4).
+    We transform covariance in XYZ to ENU at solution.
+    """
+    if H.shape[0] < 4:
+        return np.nan, np.nan, np.nan
+    # Covariance up to a scale: Q = (H^T H)^{-1}
     try:
-        arr = np.genfromtxt(path, delimiter=',')
-        if arr.ndim == 0:  # empty or not found
-            return None
-        return arr
-    except Exception:
-        return None
+        Q = np.linalg.inv(H.T @ H)
+    except np.linalg.LinAlgError:
+        return np.nan, np.nan, np.nan
 
-def load_csv_required(path, shape_hint=None):
-    arr = np.genfromtxt(path, delimiter=',')
-    if arr.ndim != 2:
-        raise RuntimeError(f"{path} must be a 2D matrix (got ndim={arr.ndim}).")
-    if shape_hint is not None and arr.shape != shape_hint:
-        raise RuntimeError(f"{path} has shape {arr.shape}, expected {shape_hint}")
-    return arr
+    # Extract XYZ block and clock
+    Q_xyz = Q[0:3, 0:3]
+    # Rotate XYZ covariance to ENU
+    R = ecef_to_enu_rotation(lat_deg, lon_deg)
+    Q_enu = R @ Q_xyz @ R.T
 
-def ecef_to_lla(ecef):
-    x, y, z = ecef
-    a  = 6378137.0
-    f  = 1/298.257223563
-    b  = a*(1 - f)
-    e2 = 1 - (b*b)/(a*a)
+    # HDOP = sqrt(var_e + var_n)
+    var_e = Q_enu[0, 0]
+    var_n = Q_enu[1, 1]
+    var_u = Q_enu[2, 2]
+    if min(var_e, var_n, var_u) < 0:
+        return np.nan, np.nan, np.nan
 
-    lon = np.arctan2(y, x)
-    r   = np.hypot(x, y)
+    HDOP = math.sqrt(var_e + var_n)
+    VDOP = math.sqrt(var_u)
+    PDOP = math.sqrt(var_e + var_n + var_u)
+    return PDOP, HDOP, VDOP
 
-    E2  = a*a - b*b
-    F   = 54.0*b*b*z*z
-    G   = r*r + (1 - e2)*z*z - e2*E2
-    c   = (e2*e2*F*r*r)/(G*G*G)
-    s   = np.cbrt(1 + c + np.sqrt(c*c + 2*c))
-    P   = F/(3*(s + 1/s + 1)**2 * G*G)
-    Q   = np.sqrt(1 + 2*e2*e2*P)
-    r0  = -(P*e2*r)/(1+Q) + np.sqrt(0.5*a*a*(1+1.0/Q) - P*(1-e2)*z*z/(Q*(1+Q)) - 0.5*P*r*r)
-    U   = np.sqrt((r - e2*r0)**2 + z*z)
-    V   = np.sqrt((r - e2*r0)**2 + (1 - e2)*z*z)
-    Z0  = (b*b*z)/(a*V)
-    h   = U*(1 - (b*b)/(a*V))
-    lat = np.arctan2(z + (e2*Z0), r)
-    return np.degrees(lat), np.degrees(lon), h
-
-def get_epoch_block(mat_pos, epoch_idx):
-    start = 3*epoch_idx
-    return mat_pos[:, start:start+3]
-
-
-def build_weights(n):
-    # equal weights placeholder; replace if you add elevation/SNR
-    return np.ones(n, dtype=float)
-
-def solve_epoch_wls(P, dts_m, ion, trp, sat_xyz, x0=None):
+def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4):
     """
-    P, dts_m, ion, trp: [Ns]
-    sat_xyz: [Ns,3]
-    Returns x_hat[4], n_it, ok
+    p_corr: (m,) corrected pseudoranges (P + clk_s - ion - trop)
+    sat_pos: (m,3) satellite ECEF positions
+    x0: initial state [x,y,z,cbias(m)] or None -> start at Earth center
+    Returns: (x,y,z,cbias_m), H_at_solution, used_sat_count, success(bool)
     """
-    # corrected equivalent geometric range
-    y = P + dts_m - ion - trp
+    # Valid satellites: need positions & pseudorange both finite
+    valid = np.isfinite(p_corr) & np.isfinite(sat_pos).all(axis=1)
+    idx = np.where(valid)[0]
+    if idx.size < 4:
+        return None, None, 0, False
 
-    good = np.isfinite(y) & np.all(np.isfinite(sat_xyz), axis=1)
-    if good.sum() < MIN_SATS:
-        return None, 0, False
+    P = p_corr[idx]
+    S = sat_pos[idx, :]
 
-    yv = y[good]
-    sv = sat_xyz[good, :]
+    # Initial state
+    if x0 is None:
+        xr = np.zeros(3, dtype=float)  # start at geocenter
+    else:
+        xr = np.array(x0[0:3], dtype=float)
+    cb = 0.0 if (x0 is None or len(x0) < 4) else float(x0[3])
 
-    x = np.array([0.0, 0.0, 0.0, 0.0]) if x0 is None else x0.copy()
-    W = build_weights(len(yv))
+    success = False
+    H_last = None
 
-    for it in range(1, MAX_ITERS+1):
-        rx, ry, rz, dtr = x
-        rcvr = np.array([rx, ry, rz])
-        diff = sv - rcvr[None, :]
-        rho  = np.linalg.norm(diff, axis=1)
-        los  = diff / rho[:, None]
-        H    = np.hstack([-los, np.ones((los.shape[0], 1))])
-        res  = yv - rho - dtr
+    for _ in range(max_iter):
+        # geometric ranges and LOS
+        diff = S - xr  # sat - rec
+        rho = np.linalg.norm(diff, axis=1)
+        # unit vectors from receiver to satellite:
+        # u = (xr - xs)/rho = -(xs - xr)/rho
+        u = (xr[None, :] - S) / rho[:, None]
 
-        sqrtW = np.sqrt(W)[:, None]
-        H_w = H * sqrtW
-        r_w = res * sqrtW[:, 0]
+        # predicted pseudorange = rho + cb
+        pred = rho + cb
+        v = P - pred  # residuals
 
+        # Build H (n x 4)
+        H = np.zeros((idx.size, 4), dtype=float)
+        H[:, 0:3] = u
+        H[:, 3] = 1.0
+
+        # LS update
         try:
-            dx, *_ = np.linalg.lstsq(H_w, r_w, rcond=None)
+            dx, *_ = np.linalg.lstsq(H, v, rcond=None)
         except np.linalg.LinAlgError:
-            return None, it, False
+            break
 
-        x += dx
-        if np.linalg.norm(dx[:3]) < TOL and abs(dx[3]) < TOL:
-                # if it > 5:
-                    return x, it, True
+        xr += dx[0:3]
+        cb += dx[3]
 
-    return x, MAX_ITERS, False
+        H_last = H
 
-def ecef_to_enu(ecef, ref_lla):
-    """
-    Convert ECEF coordinates to ENU (East-North-Up) frame.
-    
-    Args:
-        ecef: [N, 3] array of ECEF coordinates (x, y, z) in meters
-        ref_lla: [3] reference point (lat_deg, lon_deg, h_m)
-    
-    Returns:
-        [N, 3] array of ENU coordinates (east, north, up) in meters
-    """
-    lat0, lon0, h0 = np.radians(ref_lla[0]), np.radians(ref_lla[1]), ref_lla[2]
-    
-    # Convert reference LLA to ECEF
-    a = 6378137.0
-    f = 1/298.257223563
-    b = a * (1 - f)
-    e2 = 1 - (b*b)/(a*a)
-    
-    N0 = a / np.sqrt(1 - e2 * np.sin(lat0)**2)
-    x0 = (N0 + h0) * np.cos(lat0) * np.cos(lon0)
-    y0 = (N0 + h0) * np.cos(lat0) * np.sin(lon0)
-    z0 = (N0 * (1 - e2) + h0) * np.sin(lat0)
-    ref_ecef = np.array([x0, y0, z0])
-    
-    # Compute delta ECEF
-    dx = ecef[:, 0] - ref_ecef[0]
-    dy = ecef[:, 1] - ref_ecef[1]
-    dz = ecef[:, 2] - ref_ecef[2]
-    
-    # Rotation matrix ECEF to ENU
-    sin_lat, cos_lat = np.sin(lat0), np.cos(lat0)
-    sin_lon, cos_lon = np.sin(lon0), np.cos(lon0)
-    
-    east  = -sin_lon * dx + cos_lon * dy
-    north = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
-    up    =  cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
-    
-    return np.column_stack([east, north, up])
+        if np.linalg.norm(dx) < tol:
+            success = True
+            break
 
-def generate_kml(llh_data, output_file="trajectory.kml"):
+    if not success:
+        # still return the last iterate if at least 4 sats
+        success = True
 
-    # Filter valid data
-    valid = np.all(np.isfinite(llh_data), axis=1)
-    if valid.sum() == 0:
-        print("No valid data for KML generation.")
-        return
-    
-    llh_valid = llh_data[valid]
-    
-    kml = simplekml.Kml()
-    
-    # Add line string for trajectory
-    linestring = kml.newlinestring(name="GNSS Trajectory")
-    coords = [(lon, lat, h) for lat, lon, h in llh_valid]
-    linestring.coords = coords
-    linestring.altitudemode = simplekml.AltitudeMode.absolute
-    linestring.style.linestyle.color = simplekml.Color.red
-    linestring.style.linestyle.width = 3
-    
-    # Add start point
-    start_point = kml.newpoint(name="Start", coords=[coords[0]])
-    start_point.style.iconstyle.icon.href = 'http://maps.google.com/mapfiles/kml/paddle/grn-circle.png'
-    
-    # Add end point
-    end_point = kml.newpoint(name="End", coords=[coords[-1]])
-    end_point.style.iconstyle.icon.href = 'http://maps.google.com/mapfiles/kml/paddle/red-circle.png'
-    
-    kml.save(output_file)
-    print(f"KML file saved: {output_file}")
+    return (xr[0], xr[1], xr[2], cb), H_last, idx.size, success
 
-def plot_2d_geographic(llh_data, output_file="trajectory_2d.png"):
-    """
-    Plot 2D geographic view of trajectory.
-    
-    Args:
-        llh_data: [N, 3] array of (lat_deg, lon_deg, h_m)
-        output_file: output PNG filename
-    """
-    valid = np.all(np.isfinite(llh_data), axis=1)
-    if valid.sum() == 0:
-        print("No valid data for 2D plot.")
-        return
-    
-    llh_valid = llh_data[valid]
-    
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    
-    # Lat-Lon plot
-    ax1.plot(llh_valid[:, 1], llh_valid[:, 0], 'b-', linewidth=1.5, label='Trajectory')
-    ax1.plot(llh_valid[0, 1], llh_valid[0, 0], 'go', markersize=10, label='Start')
-    ax1.plot(llh_valid[-1, 1], llh_valid[-1, 0], 'ro', markersize=10, label='End')
-    ax1.set_xlabel('Longitude (deg)', fontsize=12)
-    ax1.set_ylabel('Latitude (deg)', fontsize=12)
-    ax1.set_title('2D Geographic Trajectory', fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    ax1.axis('equal')
-    
-    # Height profile
-    epochs = np.arange(len(llh_valid))
-    ax2.plot(epochs, llh_valid[:, 2], 'b-', linewidth=1.5)
-    ax2.set_xlabel('Epoch', fontsize=12)
-    ax2.set_ylabel('Height (m)', fontsize=12)
-    ax2.set_title('Height Profile', fontsize=14, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"2D plot saved: {output_file}")
-    plt.close()
-
-def plot_3d_enu(ecef_data, llh_data, output_file="trajectory_3d_enu.png"):
-    """
-    Plot 3D trajectory in ENU frame.
-    
-    Args:
-        ecef_data: [N, 3] array of ECEF coordinates (x, y, z)
-        llh_data: [N, 3] array of (lat_deg, lon_deg, h_m)
-        output_file: output PNG filename
-    """
-    valid = np.all(np.isfinite(ecef_data), axis=1) & np.all(np.isfinite(llh_data), axis=1)
-    if valid.sum() == 0:
-        print("No valid data for 3D ENU plot.")
-        return
-    
-    ecef_valid = ecef_data[valid]
-    llh_valid = llh_data[valid]
-    
-    # Use first valid point as reference
-    ref_lla = llh_valid[0]
-    
-    # Convert to ENU
-    enu = ecef_to_enu(ecef_valid, ref_lla)
-    
-    fig = plt.figure(figsize=(12, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Plot trajectory
-    ax.plot(enu[:, 0], enu[:, 1], enu[:, 2], 'b-', linewidth=2, label='Trajectory')
-    ax.scatter(enu[0, 0], enu[0, 1], enu[0, 2], c='g', s=100, marker='o', label='Start')
-    ax.scatter(enu[-1, 0], enu[-1, 1], enu[-1, 2], c='r', s=100, marker='o', label='End')
-    
-    ax.set_xlabel('East (m)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('North (m)', fontsize=12, fontweight='bold')
-    ax.set_zlabel('Up (m)', fontsize=12, fontweight='bold')
-    ax.set_title(f'3D ENU Trajectory\nReference: ({ref_lla[0]:.6f}°, {ref_lla[1]:.6f}°, {ref_lla[2]:.2f}m)', 
-                 fontsize=14, fontweight='bold')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"3D ENU plot saved: {output_file}")
-    plt.close()
-
-# ---------------------------
-# Main
-# ---------------------------
 def main():
-    # Load required
-    P_mat   = load_csv_required(FILE_PSEUDO)
-    dts_raw = load_csv_required(FILE_CLK)
-    ion_mat = load_csv_required(FILE_IONO, shape_hint=P_mat.shape)
-    trp_mat = load_csv_required(FILE_TROPO, shape_hint=P_mat.shape)
-    pos_mat = np.genfromtxt(FILE_POS, delimiter=',')
-    if pos_mat.shape[0] != P_mat.shape[0] or pos_mat.shape[1] != P_mat.shape[1]*3:
-        raise RuntimeError(f"{FILE_POS} has shape {pos_mat.shape}, expected {(P_mat.shape[0], P_mat.shape[1]*3)}")
+    # 直接在此处指定输入/输出文件路径，替换为你的实际路径
+    pseudoranges = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/pseudoranges_meas.csv"
+    sat_clk      = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/satellite_clock_bias.csv"
+    ion          = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/ionospheric_delay.csv"
+    trop         = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/tropospheric_delay.csv"
+    sat_pos      = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/satellite_positions.csv"
+    out_path     = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/lse_solution.csv"
 
-    max_sats, num_epochs = P_mat.shape
+    # 可选初值（如果需要），否则置 None
+    llh0 = None  # e.g. "22.304139 114.180131 -20.2" -> set below if needed
 
-    # Outputs
-    X_est   = np.full((num_epochs, 4), np.nan)
-    LLH_est = np.full((num_epochs, 3), np.nan)
-    iters   = np.zeros(num_epochs, dtype=int)
-    flags   = np.zeros(num_epochs, dtype=bool)
+    # 迭代参数
+    max_iter = 20
+    tol = 1e-4
 
-    x_prev = None
+    # 读取文件（与原来行为一致）
+    P = load_csv(pseudoranges)          # (Smax, E)
+    CLK = load_csv(sat_clk)             # (Smax, E)
+    ION = load_csv(ion)                 # (Smax, E)
+    TRP = load_csv(trop)                # (Smax, E)
+    SATM = load_csv(sat_pos)            # (Smax, 3E)
 
-    for e in range(num_epochs):
-        # Build epoch data robustly
-        Sxyz = get_epoch_block(pos_mat, e)  # [max_sats,3]
-        Pcol = P_mat[:, e]
-        Dcol = dts_raw[:, e]
-        Icol = ion_mat[:, e]
-        Tcol = trp_mat[:, e]
+    # Basic checks（保持原逻辑）
+    if P.ndim != 2 or CLK.ndim != 2 or ION.ndim != 2 or TRP.ndim != 2 or SATM.ndim != 2:
+        raise ValueError("All CSVs must be 2D matrices.")
+    Smax, E = P.shape
+    if CLK.shape != (Smax, E) or ION.shape != (Smax, E) or TRP.shape != (Smax, E):
+        raise ValueError("pseudorange/clock/ion/trop shapes must all be (max_sats, num_epochs)")
+    if SATM.shape[0] != Smax or SATM.shape[1] != 3*E:
+        raise ValueError("satellite_positions.csv must be (max_sats, num_epochs*3)")
 
+    sat_per_epoch = split_sat_positions_matrix(SATM)  # list length E, each (Smax,3)
 
-        # No map: rely on all fields finite (old behavior)
-        good = np.isfinite(Pcol) & np.all(np.isfinite(Sxyz), axis=1) & \
-        np.isfinite(Dcol) & np.isfinite(Icol) & np.isfinite(Tcol)
+    # Initial guess
+    x0 = None
+    if llh0 is not None:
+        llh0_vals = [float(v) for v in llh0.strip().split()]
+        if len(llh0_vals) != 3:
+            raise ValueError("llh0 must be 3 numbers: 'lat lon h'")
+        xyz0 = lla_to_ecef(llh0_vals[0], llh0_vals[1], llh0_vals[2])
+        x0 = np.array([xyz0[0], xyz0[1], xyz0[2], 0.0], dtype=float)
 
-        if good.sum() < MIN_SATS:
-            iters[e] = 0
-            flags[e] = False
-            print(f"[Epoch {e+1:4d}/{num_epochs}] insufficient valid sats: {good.sum()}")
+    results = []
+    for k in range(E):
+        # corrected pseudorange (meters)
+        P_corr = P[:, k] + CLK[:, k] - ION[:, k] - TRP[:, k]
+        S_k = sat_per_epoch[k]  # (Smax,3)
+
+        sol, H, ns, ok = solve_epoch_ls(
+            P_corr, S_k, x0=x0, max_iter=max_iter, tol=tol
+        )
+
+        if (not ok) or (sol is None):
+            results.append([k+1] + [np.nan]*11)  # epoch index starting at 1
             continue
 
-        P_use    = Pcol[good]
-        D_use    = Dcol[good]
-        I_use    = Icol[good]
-        T_use    = Tcol[good]
-        S_use    = Sxyz[good, :]
+        xs, ys, zs, cb_m = sol
+        lat, lon, h = ecef_to_lla(xs, ys, zs)
 
-        x0 = x_prev if (USE_LAST_AS_INIT and x_prev is not None) else None
-        x_hat, n_it, ok = solve_epoch_wls(P_use, D_use, I_use, T_use, S_use, x0=x0)
+        PDOP, HDOP, VDOP = (np.nan, np.nan, np.nan)
+        if H is not None and ns >= 4 and np.isfinite(lat) and np.isfinite(lon):
+            PDOP, HDOP, VDOP = compute_dops(H, lat, lon)
 
-        iters[e] = n_it
-        flags[e] = ok
-        if ok:
-            X_est[e, :] = x_hat
-            LLH_est[e, :] = ecef_to_lla(x_hat[:3])
-            x_prev = x_hat
-            print(f"[Epoch {e+1:4d}/{num_epochs}] iters={n_it:3d}  "
-                  f"ECEF=({x_hat[0]:.3f},{x_hat[1]:.3f},{x_hat[2]:.3f})  dtr={x_hat[3]:.3f}")
-        else:
-            print(f"[Epoch {e+1:4d}/{num_epochs}] WLS failed (iters={n_it})")
+        results.append([
+            k+1, xs, ys, zs, lat, lon, h, cb_m, int(ns),
+            PDOP, HDOP, VDOP
+        ])
 
-    # Save results
-    np.savetxt("wls_ecef_clk.csv", X_est, delimiter=',', header="x(m),y(m),z(m),dtr(m)", comments='')
-    np.savetxt("wls_llh.csv", LLH_est, delimiter=',', header="lat(deg),lon(deg),h(m)", comments='')
-    np.savetxt("wls_iters_ok.csv", np.vstack([iters, flags.astype(int)]).T, delimiter=',', header="iters,ok(1/0)", comments='')
+        # Use previous solution as next initial guess (helps convergence)
+        x0 = np.array([xs, ys, zs, cb_m], dtype=float)
 
-    print("\nDone. Files written:\n  - wls_ecef_clk.csv\n  - wls_llh.csv\n  - wls_iters_ok.csv")
-    
-    # Generate visualizations
-    print("\nGenerating visualizations...")
-    generate_kml(LLH_est, "trajectory.kml")
-    plot_2d_geographic(LLH_est, "trajectory_2d.png")
-    plot_3d_enu(X_est[:, :3], LLH_est, "trajectory_3d_enu.png")
-    
-    print("\nAll outputs completed!")
-    print("  - trajectory.kml")
-    print("  - trajectory_2d.png")
-    print("  - trajectory_3d_enu.png\n")
+    # Save
+    header = "epoch,x,y,z,lat_deg,lon_deg,h_m,clock_bias_m,nsat,PDOP,HDOP,VDOP"
+    out = np.array(results, dtype=float)
+    np.savetxt(out_path, out, delimiter=",", header=header, comments="", fmt="%.10f")
+    print(f"Saved {out_path} with {out.shape[0]} epochs.")
 
 if __name__ == "__main__":
     main()
