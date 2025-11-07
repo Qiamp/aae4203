@@ -1,1172 +1,563 @@
 """
-Single Point Positioning (SPP) port of RTKLIB's pntpos.c.
-Reads RINEX observation/navigation files and outputs CSV/KML solutions.
+RINEX 3.0.x GPS-only SPP with WLS
+现在: 直接在代码中指定 OBS / NAV 路径, 不再需要命令行参数。
+- Ionosphere: IF (C1/C2) if available; else Klobuchar (GPSA/GPSB)
+- Troposphere: Saastamoinen + Niell mapping; optional ZWD estimation
+- Outputs per-epoch ENU (relative to reference), 2D/3D errors, DOPs, and summary stats
+
+Author: ChatGPT (GPT-5)
 """
-from __future__ import annotations
 
-import argparse
-import datetime as dt
 import math
-import pathlib
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
-import georinex as gr  # type: ignore
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
 import numpy as np
-import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Constants and configuration mirrors
-# ---------------------------------------------------------------------------
+# Constants
+C = 299792458.0
+MU_E = 3.986005e14
+OMEGA_E = 7.2921151467e-5
+F_REL = -4.442807633e-10
+F_L1 = 1575.42e6
+F_L2 = 1227.60e6
 
-CLIGHT = 299792458.0
-OMGE = 7.2921151467e-5
-MU_GPS = 3.986005e14
-MU_CMP = 3.986004418e14
-MU_GAL = 3.986004418e14
-MU_QZS = 3.986005e14
-MU_IRN = 3.986004418e14
-MU_GLO = 3.9860044e14
-MU_SBAS = MU_GPS
-
-FREQ_GPS_L1 = 1575.42e6
-FREQ_GPS_L2 = 1227.60e6
-FREQ_GPS_L5 = 1176.45e6
-
-FREQ_GAL_E1 = 1575.42e6
-FREQ_GAL_E5a = 1176.45e6
-FREQ_GAL_E5b = 1207.14e6
-
-FREQ_CMP_B1 = 1575.42e6
-FREQ_CMP_B1I = 1561.098e6
-FREQ_CMP_B2 = 1207.14e6
-FREQ_CMP_B2I = 1207.14e6
-FREQ_CMP_B3 = 1268.52e6
-
-FREQ_QZS_L1 = 1575.42e6
-FREQ_QZS_L2 = 1227.60e6
-FREQ_QZS_L5 = 1176.45e6
-FREQ_QZS_LEX = 1278.75e6
-
-FREQ_IRN_L5 = 1176.45e6
-FREQ_IRN_S = 2492.028e6
-
-FREQ_GLO_G1 = 1602.0e6
-FREQ_GLO_G2 = 1246.0e6
-FREQ_GLO_G3 = 1202.025e6
-DFRQ1_GLO = 0.5625e6
-DFRQ2_GLO = 0.4375e6
-
-RE_WGS84 = 6378137.0
-FE_WGS84 = 1.0 / 298.257223563
-
-D2R = math.pi / 180.0
-R2D = 180.0 / math.pi
-
-ERR_ION = 5.0
-ERR_TROP = 3.0
-ERR_SAAS = 0.3
-ERR_BRDCI = 0.5
-ERR_CBIAS = 0.3
-REL_HUMI = 0.7
-MIN_EL = 5.0 * D2R
-MAX_GDOP = 30.0
-MAXITR = 10
-
-SQR = lambda x: x * x
-
-GPS_EPOCH = dt.datetime(1980, 1, 6, tzinfo=dt.timezone.utc)
-
-SYS_GPS = 1
-SYS_GLO = 2
-SYS_GAL = 4
-SYS_CMP = 8
-SYS_QZS = 16
-SYS_SBS = 32
-SYS_IRN = 64
-
-PMODE_SINGLE = 0
-IONOOPT_OFF = 0
-IONOOPT_BRDC = 1
-IONOOPT_SBAS = 2
-IONOOPT_IFLC = 3
-IONOOPT_EST = 4
-IONOOPT_TEC = 5
-IONOOPT_QZS = 6
-
-TROPOPT_OFF = 0
-TROPOPT_SAAS = 1
-TROPOPT_SBAS = 2
-TROPOPT_EST = 3
-TROPOPT_ESTG = 4
-
-EPHOPT_BRDC = 0
-EPHOPT_SBAS = 1
-EPHOPT_PREC = 2
-EPHOPT_SSRC = 3
-
-SOLQ_NONE = 0
-SOLQ_SINGLE = 1
-SOLQ_SBAS = 2
-
-SVH_OK = 0
-SVH_UNHEALTHY = 1
-
-MAXSAT = 256
-MAXOBS = 64
-NX = 9  # position+clock+inter-system offset state (with QZSS)
-NFREQ = 3
-
-CHISQR = np.array([
-    0.0, 0.0, 5.9915, 7.8147, 9.4877, 11.0705, 12.5916, 14.0671, 15.5073,
-    16.9189, 18.3070, 19.6751, 21.0261, 22.3620, 23.6848, 24.9958, 26.2962,
-    27.5871, 28.8693, 30.1435, 31.4104, 32.6706, 33.9245, 35.1725, 36.4150,
-    37.6525, 38.8851, 40.1133, 41.3372, 42.5570, 43.7730, 44.9853, 46.1942,
-    47.3999, 48.6024, 49.8018, 50.9985, 52.1922, 53.3832, 54.5716, 55.7574,
-    56.9406, 58.1215, 59.2999, 60.4760, 61.6498, 62.8212, 63.9904, 65.1574,
-    66.3222, 67.4849, 68.6455, 69.8040, 70.9605, 72.1149, 73.2673, 74.4177,
-    75.5662, 76.7128, 77.8574, 79.0002, 80.1411, 81.2802, 82.4174, 83.5529,
-    84.6867, 85.8187, 86.9490, 88.0777, 89.2047, 90.3300, 91.4538, 92.5759,
-    93.6965, 94.8156, 95.9331, 97.0491, 98.1637, 99.2767, 100.3883, 101.4985,
-    102.6073, 103.7146, 104.8205, 105.9250, 107.0282, 108.1299, 109.2303,
-    110.3294, 111.4271, 112.5235, 113.6186, 114.7124, 115.8049, 116.8961
-])
-
-# ---------------------------------------------------------------------------
-# Data structures mirroring RTKLIB
-# ---------------------------------------------------------------------------
+# ----------------------------
+# Data classes
+# ----------------------------
+@dataclass
+class ObsEpoch:
+    t_gps: float
+    week: int
+    sats: List[str]
+    types_G: List[str]
+    data: Dict[str, List[float]]  # prn -> list aligned with types_G
 
 @dataclass
-class SNRMask:
-    ena: Tuple[int, int] = (0, 0)
-    mask: np.ndarray = field(
-        default_factory=lambda: np.zeros((NFREQ, 11), dtype=float)
-    )
-
-@dataclass
-class ProcOptions:
-    mode: int = PMODE_SINGLE
-    ionoopt: int = IONOOPT_BRDC
-    tropopt: int = TROPOPT_SAAS
-    sateph: int = EPHOPT_BRDC
-    posopt: Tuple[int, int, int, int, int, int] = (0, 0, 0, 0, 0, 0)
-    elmin: float = MIN_EL
-    err: np.ndarray = field(default_factory=lambda: np.array(
-        [100.0, 0.003, 0.003, 0.0, 0.003, 30.0, 0.3, 0.0], dtype=float))
-    eratio: np.ndarray = field(default_factory=lambda: np.array([300.0, 300.0, 300.0]))
-    snrmask: SNRMask = field(default_factory=SNRMask)
-    nf: int = 2
-
-@dataclass
-class Observation:
-    time: dt.datetime
-    sat: int
-    code: List[str]
-    P: np.ndarray
-    L: np.ndarray
-    D: np.ndarray
-    SNR: np.ndarray
-    Pstd: np.ndarray
-    eventime: float = 0.0
-
-@dataclass
-class BroadcastEphemeris:
-    sat: int
-    toe: float
+class Eph:
+    prn: str
     toc: float
-    ttr: float
-    A: float
-    e: float
-    i0: float
-    OMG0: float
-    omg: float
-    M0: float
-    deltan: float
-    OMGd: float
-    idot: float
-    Cuc: float
-    Cus: float
-    Crc: float
-    Crs: float
-    Cic: float
-    Cis: float
+    week: int
     af0: float
     af1: float
     af2: float
-    tgd: Tuple[float, float, float, float]
+    crs: float
+    delta_n: float
+    m0: float
+    cuc: float
+    e: float
+    cus: float
+    sqrt_a: float
+    toe: float
+    cic: float
+    omega0: float
+    cis: float
+    i0: float
+    crc: float
+    w: float
+    omega_dot: float
+    idot: float
+    health: int
     iode: int
     iodc: int
-    week: int
-    svh: int
     ura: float
-    fit: int
-    prn: int
-    sys: int
 
 @dataclass
-class NavigationData:
-    eph: Dict[int, List[BroadcastEphemeris]] = field(default_factory=dict)
-    ion_gps: np.ndarray = field(default_factory=lambda: np.zeros(8))
-    ion_qzs: np.ndarray = field(default_factory=lambda: np.zeros(8))
-    cbias: Dict[int, np.ndarray] = field(default_factory=dict)
-    leaps: int = 18
+class NavHeader:
+    ion_alpha: Optional[List[float]]
+    ion_beta: Optional[List[float]]
 
-@dataclass
-class Solution:
-    time: dt.datetime = GPS_EPOCH
-    rr: np.ndarray = field(default_factory=lambda: np.zeros(6))
-    qr: np.ndarray = field(default_factory=lambda: np.zeros(6, dtype=float))
-    qv: np.ndarray = field(default_factory=lambda: np.zeros(6, dtype=float))
-    dtr: np.ndarray = field(default_factory=lambda: np.zeros(6))
-    type: int = 0
-    stat: int = SOLQ_NONE
-    ns: int = 0
-    age: float = 0.0
-    ratio: float = 0.0
-    eventime: float = 0.0
+# ----------------------------
+# Time utilities
+# ----------------------------
+def ymd_to_jd(y,m,d):
+    a=(14-m)//12
+    y2=y+4800-a
+    m2=m+12*a-3
+    jd=d+(153*m2+2)//5+365*y2+y2//4-y2//100+y2//400-32045
+    return jd+0.5
 
-@dataclass
-class SatelliteStatus:
-    azel: np.ndarray = field(default_factory=lambda: np.zeros(2))
-    resp: np.ndarray = field(default_factory=lambda: np.zeros(1))
-    resc: np.ndarray = field(default_factory=lambda: np.zeros(1))
-    snr_rover: np.ndarray = field(default_factory=lambda: np.zeros(NFREQ))
-    snr_base: np.ndarray = field(default_factory=lambda: np.zeros(NFREQ))
-    vs: int = 0
+def ymdhms_to_gpsweek(y, m, d, hh, mm, ssf) -> Tuple[int, float]:
+    jd = ymd_to_jd(y,m,d) + (hh-12)/24 + mm/1440 + ssf/86400
+    jd_gps0 = 2444244.5
+    sow_total = (jd - jd_gps0) * 86400.0
+    week = int(sow_total // 604800)
+    sow = sow_total - week*604800
+    return week, sow
 
-# ---------------------------------------------------------------------------
-# Satellite numbering helpers
-# ---------------------------------------------------------------------------
+def time_diff_gps(t1, t0):
+    dt = t1 - t0
+    if dt > 302400: dt -= 604800
+    if dt < -302400: dt += 604800
+    return dt
 
-SAT_OFFSETS = {
-    SYS_GPS: 0,
-    SYS_SBS: 32,
-    SYS_GLO: 32 + 32,
-    SYS_GAL: 32 + 32 + 27,
-    SYS_CMP: 32 + 32 + 27 + 36,
-    SYS_QZS: 32 + 32 + 27 + 36 + 63,
-    SYS_IRN: 32 + 32 + 27 + 36 + 63 + 7,
-}
+# ----------------------------
+# RINEX 3 NAV parser (GPS)
+# ----------------------------
+def parse_rinex3_nav(path:str) -> Tuple[NavHeader, Dict[str, List[Eph]]]:
+    ion_alpha=None; ion_beta=None
+    ephs: Dict[str, List[Eph]] = {}
+    with open(path,'r',encoding='utf-8',errors='ignore') as f:
+        lines=f.readlines()
+    i=0
+    # Header
+    while i < len(lines):
+        line = lines[i]
+        if "IONOSPHERIC CORR" in line and "GPSA" in line:
+            vals=[float(line[5:17]),float(line[17:29]),float(line[29:41]),float(line[41:53])]
+            ion_alpha=vals
+        if "IONOSPHERIC CORR" in line and "GPSB" in line:
+            vals=[float(line[5:17]),float(line[17:29]),float(line[29:41]),float(line[41:53])]
+            ion_beta=vals
+        if "END OF HEADER" in line:
+            i+=1
+            break
+        i+=1
+    header = NavHeader(ion_alpha=ion_alpha, ion_beta=ion_beta)
 
-SYS_CHAR = {
-    'G': SYS_GPS,
-    'R': SYS_GLO,
-    'E': SYS_GAL,
-    'C': SYS_CMP,
-    'J': SYS_QZS,
-    'S': SYS_SBS,
-    'I': SYS_IRN,
-}
+    def to_float(s): 
+        return float(s.replace('D','E').replace('d','E')) if s.strip() else 0.0
 
-def satno(sys: int, prn: int) -> int:
-    return SAT_OFFSETS.get(sys, 0) + prn
+    # Body (RINEX 3 GPS: 8 lines per record)
+    while i < len(lines):
+        if not lines[i].strip():
+            i+=1; continue
+        line0 = lines[i]
+        prn = line0[0:3].strip()
+        if not prn or prn[0] != 'G':
+            # Skip non-GPS
+            # but consume 8 lines in case
+            i += 8
+            continue
+        year = int(line0[3:7]); month=int(line0[8:10]); day=int(line0[11:13])
+        hour=int(line0[14:16]); minute=int(line0[17:19]); sec=float(line0[20:22])
+        af0 = to_float(line0[22:41]); af1 = to_float(line0[41:60]); af2 = to_float(line0[60:79])
+        p=[]
+        for k in range(7):
+            i+=1
+            l=lines[i]
+            # RINEX3 fields 4 per line after 3-char indent
+            p.extend([to_float(l[3+19*j:3+19*(j+1)]) for j in range(4)])
+        # Assign
+        crs, delta_n, m0 = p[0], p[1], p[2]
+        cuc, e, cus, sqrt_a = p[4], p[5], p[6], p[7]
+        toe, cic, omega0, cis = p[8], p[9], p[10], p[11]
+        i0, crc, w, omega_dot = p[12], p[13], p[14], p[15]
+        idot = p[16]
+        gps_week = int(round(p[18])) if len(p) > 19 else 0
+        ura = p[20] if len(p) > 21 else 0.0
+        health = int(round(p[21])) if len(p) > 22 else 0
+        iodc = int(round(p[23])) if len(p) > 24 else 0
+        iode = int(round(p[3])) if len(p) > 4 else 0
 
-def satsys(sat: int) -> Tuple[int, int]:
-    for sys, off in sorted(SAT_OFFSETS.items(), key=lambda x: x[1], reverse=True):
-        if sat > off:
-            return sys, sat - off
-    return SYS_GPS, sat
+        week, sow = ymdhms_to_gpsweek(year,month,day,hour,minute,sec)
+        eph = Eph(prn=prn, toc=sow, week=week, af0=af0, af1=af1, af2=af2,
+                  crs=crs, delta_n=delta_n, m0=m0, cuc=cuc, e=e, cus=cus, sqrt_a=sqrt_a,
+                  toe=toe, cic=cic, omega0=omega0, cis=cis, i0=i0, crc=crc, w=w,
+                  omega_dot=omega_dot, idot=idot, health=health, iode=iode, iodc=iodc, ura=ura)
+        ephs.setdefault(prn, []).append(eph)
+        i+=1
+    # sort by toe desc
+    for k in ephs:
+        ephs[k].sort(key=lambda e: e.toe, reverse=True)
+    return header, ephs
 
-# ---------------------------------------------------------------------------
-# Matrix helpers
-# ---------------------------------------------------------------------------
+# ----------------------------
+# RINEX 3 OBS parser (GPS)
+# ----------------------------
+def parse_rinex3_obs(path:str) -> Tuple[List[str], List[ObsEpoch]]:
+    with open(path,'r',encoding='utf-8',errors='ignore') as f:
+        lines=f.readlines()
+    i=0
+    types_G: List[str] = []
+    # Header
+    while i < len(lines):
+        line=lines[i]
+        if "SYS / # / OBS TYPES" in line and line[0]=='G':
+            n = int(line[3:6])
+            types = [line[7+4*k:11+4*k].strip() for k in range(min(n,13))]
+            while len(types) < n:
+                i+=1
+                line=lines[i]
+                types += [line[7+4*k:11+4*k].strip() for k in range(min(n-len(types),13))]
+            types_G = types
+        if "END OF HEADER" in line:
+            i+=1
+            break
+        i+=1
+    if not types_G:
+        raise ValueError("No GPS observation types found in header (SYS / # / OBS TYPES for G).")
+    epochs: List[ObsEpoch] = []
+    # Body
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip(): i+=1; continue
+        if line[0] != '>':
+            i+=1; continue
+        year=int(line[2:6]); month=int(line[7:9]); day=int(line[10:12])
+        hour=int(line[13:15]); minute=int(line[16:18]); sec=float(line[19:29])
+        flag=int(line[31:32]) if len(line)>=32 else 0
+        nsat=int(line[32:35])
+        week, sow = ymdhms_to_gpsweek(year,month,day,hour,minute,sec)
+        sats=[]; data={}
+        for k in range(nsat):
+            i+=1
+            l=lines[i]
+            prn=l[0:3].strip()
+            sats.append(prn)
+            vals=[]
+            pos=3
+            for t in types_G:
+                if pos+16 <= len(l):
+                    vstr=l[pos:pos+14].strip()
+                    v=float(vstr.replace('D','E')) if vstr else float('nan')
+                    vals.append(v)
+                else:
+                    vals.append(float('nan'))
+                pos+=16
+            data[prn]=vals
+        epochs.append(ObsEpoch(t_gps=sow, week=week, sats=sats, types_G=types_G, data=data))
+        i+=1
+    return types_G, epochs
 
-def mat(rows: int, cols: int) -> np.ndarray:
-    return np.zeros((rows, cols), dtype=float)
+# ----------------------------
+# Coordinate transforms
+# ----------------------------
+def llh_to_ecef(lat, lon, h):
+    a=6378137.0; f=1/298.257223563; e2=f*(2-f)
+    N=a/math.sqrt(1-e2*math.sin(lat)**2)
+    x=(N+h)*math.cos(lat)*math.cos(lon)
+    y=(N+h)*math.cos(lat)*math.sin(lon)
+    z=(N*(1-e2)+h)*math.sin(lat)
+    return np.array([x,y,z],dtype=float)
 
-def zeros(rows: int, cols: int) -> np.ndarray:
-    return np.zeros((rows, cols), dtype=float)
-
-def dot(v1: np.ndarray, v2: np.ndarray) -> float:
-    return float(np.dot(v1, v2))
-
-def dot3(a: Sequence[float], b: Sequence[float]) -> float:
-    return float(a[0] * b[0] + a[1] * b[1] + a[2] * b[2])
-
-def norm(v: Sequence[float]) -> float:
-    return float(np.linalg.norm(v))
-
-def lsq(H: np.ndarray, v: np.ndarray, nx: int, nv: int) -> Tuple[np.ndarray, float, np.ndarray]:
-    sol, residuals, rank, s = np.linalg.lstsq(H[:nv, :nx], v[:nv], rcond=None)
-    Q = np.linalg.inv(H[:nv, :nx].T @ H[:nv, :nx])
-    return sol, residuals[0] if residuals.size else 0.0, Q
-
-# ---------------------------------------------------------------------------
-# Time helpers
-# ---------------------------------------------------------------------------
-
-def datetime_to_gps_seconds(time: dt.datetime) -> float:
-    if time.tzinfo is None:
-        time = time.replace(tzinfo=dt.timezone.utc)
-    return (time - GPS_EPOCH).total_seconds()
-
-def gps_seconds_to_datetime(seconds: float) -> dt.datetime:
-    return GPS_EPOCH + dt.timedelta(seconds=seconds)
-
-def timeadd(time: dt.datetime, sec: float) -> dt.datetime:
-    return time + dt.timedelta(seconds=sec)
-
-def timediff(t1: dt.datetime, t2: dt.datetime) -> float:
-    return (t1 - t2).total_seconds()
-
-# ---------------------------------------------------------------------------
-# Geodetic conversions and geometry
-# ---------------------------------------------------------------------------
-
-def ecef2pos(r: Sequence[float]) -> np.ndarray:
-    x, y, z = r
-    e2 = FE_WGS84 * (2.0 - FE_WGS84)
-    r2 = x * x + y * y
-    v = RE_WGS84
-    lat = math.atan2(z, math.sqrt(r2))
-    lon = math.atan2(y, x)
-    h = 0.0
+def ecef_to_llh(xyz):
+    a=6378137.0; f=1/298.257223563; e2=f*(2-f)
+    x,y,z=xyz
+    lon=math.atan2(y,x)
+    r=math.hypot(x,y)
+    lat=math.atan2(z, r*(1-e2))
     for _ in range(5):
-        sinp = math.sin(lat)
-        v = RE_WGS84 / math.sqrt(1.0 - e2 * sinp * sinp)
-        h = r2 ** 0.5 / math.cos(lat) - v
-        lat = math.atan2(z, r2 ** 0.5 * (1.0 - e2 * v / (v + h)))
-    return np.array([lat, lon, h], dtype=float)
+        N=a/math.sqrt(1-e2*math.sin(lat)**2)
+        h=r/math.cos(lat)-N
+        lat=math.atan2(z, r*(1-e2*N/(N+h)))
+    N=a/math.sqrt(1-e2*math.sin(lat)**2)
+    h=r/math.cos(lat)-N
+    return lat,lon,h
 
-def pos2ecef(pos: Sequence[float]) -> np.ndarray:
-    lat, lon, h = pos
-    sinp = math.sin(lat)
-    cosp = math.cos(lat)
-    sinl = math.sin(lon)
-    cosl = math.cos(lon)
-    e2 = FE_WGS84 * (2.0 - FE_WGS84)
-    v = RE_WGS84 / math.sqrt(1.0 - e2 * sinp * sinp)
-    x = (v + h) * cosp * cosl
-    y = (v + h) * cosp * sinl
-    z = (v * (1.0 - e2) + h) * sinp
-    return np.array([x, y, z], dtype=float)
-
-def xyz2enu(pos: Sequence[float]) -> np.ndarray:
-    lat, lon = pos[0], pos[1]
-    sinp, cosp = math.sin(lat), math.cos(lat)
-    sinl, cosl = math.sin(lon), math.cos(lon)
+def ecef_to_enu_matrix(lat, lon):
+    sl=math.sin(lat); cl=math.cos(lat)
+    slon=math.sin(lon); clon=math.cos(lon)
     return np.array([
-        [-sinl, cosl, 0.0],
-        [-sinp * cosl, -sinp * sinl, cosp],
-        [cosp * cosl, cosp * sinl, sinp]
-    ], dtype=float)
+        [-slon,        clon,      0],
+        [-sl*clon, -sl*slon,    cl],
+        [ cl*clon,  cl*slon,    sl],
+    ])
 
-def geodist(rs: Sequence[float], rr: Sequence[float]) -> Tuple[float, np.ndarray]:
-    e = np.array(rs[:3], dtype=float) - np.array(rr[:3], dtype=float)
-    r = norm(e)
-    if r <= 0.0:
-        return 0.0, np.zeros(3, dtype=float)
-    return r, e / r
+def az_el(rx_ecef, sv_ecef):
+    lat,lon,h = ecef_to_llh(rx_ecef)
+    E = ecef_to_enu_matrix(lat,lon)
+    rho = sv_ecef - rx_ecef
+    enu = E @ rho
+    e,n,u = enu
+    az = math.atan2(e,n) % (2*math.pi)
+    el = math.atan2(u, math.hypot(e,n))
+    rng = np.linalg.norm(rho)
+    return az, el, rng
 
-def satazel(pos: Sequence[float], e: Sequence[float]) -> float:
-    E = xyz2enu(pos)
-    enu = E @ e
-    az = math.atan2(enu[0], enu[1])
-    if az < 0.0:
-        az += 2.0 * math.pi
-    el = math.asin(enu[2])
-    return el
+# ----------------------------
+# Dynamics and models
+# ----------------------------
+def solve_kepler(M,e,tol=1e-12,maxit=30):
+    E=M
+    for _ in range(maxit):
+        f=E-e*math.sin(E)-M
+        d=1-e*math.cos(E)
+        dE=-f/d
+        E+=dE
+        if abs(dE)<tol: break
+    return E
 
-def dops(n: int, azel: np.ndarray, elmin: float, dop: np.ndarray) -> None:
-    H = []
-    for i in range(n):
-        el = azel[1 + 2 * i]
-        if el < elmin:
-            continue
-        az = azel[2 * i]
-        s = math.sin(el)
-        c = math.cos(el)
-        H.append([-c * math.sin(az), -c * math.cos(az), -s, 1.0])
-    if len(H) < 4:
-        dop[:] = 0.0
-        return
-    H = np.array(H)
-    Q = np.linalg.inv(H.T @ H)
-    dop[0] = math.sqrt(Q[0, 0] + Q[1, 1] + Q[2, 2] + Q[3, 3])
-    dop[1] = math.sqrt(Q[0, 0] + Q[1, 1])
-    dop[2] = math.sqrt(Q[2, 2])
-    dop[3] = math.sqrt(Q[3, 3])
+def kepler_orbit(eph:Eph, t_tx:float) -> Tuple[np.ndarray, float]:
+    tk = time_diff_gps(t_tx, eph.toe)
+    a = eph.sqrt_a**2
+    n0 = math.sqrt(MU_E/a**3)
+    n = n0 + eph.delta_n
+    M = eph.m0 + n*tk
+    E = solve_kepler(M, eph.e)
+    sinE=math.sin(E); cosE=math.cos(E)
+    v = math.atan2(math.sqrt(1-eph.e**2)*sinE, cosE - eph.e)
+    phi = v + eph.w
+    sin2=math.sin(2*phi); cos2=math.cos(2*phi)
+    du = eph.cus*sin2 + eph.cuc*cos2
+    dr = eph.crs*sin2 + eph.crc*cos2
+    di = eph.cis*sin2 + eph.cic*cos2
+    u = phi + du
+    r = a*(1 - eph.e*cosE) + dr
+    i = eph.i0 + di + eph.idot*tk
+    x_orb = r*math.cos(u)
+    y_orb = r*math.sin(u)
+    omega = eph.omega0 + (eph.omega_dot - OMEGA_E)*tk - OMEGA_E*eph.toe
+    cosO=math.cos(omega); sinO=math.sin(omega)
+    cosi=math.cos(i); sini=math.sin(i)
+    x = x_orb*cosO - y_orb*cosi*sinO
+    y = x_orb*sinO + y_orb*cosi*cosO
+    z = y_orb*sini
+    r_ecef = np.array([x,y,z],dtype=float)
+    dt_rel = F_REL * eph.e * eph.sqrt_a * sinE
+    dts = eph.af0 + eph.af1*(t_tx - eph.toc) + eph.af2*(t_tx - eph.toc)**2 + dt_rel
+    return r_ecef, dts
 
-# ---------------------------------------------------------------------------
-# Atmospheric models
-# ---------------------------------------------------------------------------
+def sagnac_correction(r_tx, r_rx):
+    return OMEGA_E / C * (r_tx[0]*r_rx[1] - r_tx[1]*r_rx[0])
 
-def ionmodel(time: dt.datetime, ion: np.ndarray, pos: Sequence[float], azel: Sequence[float]) -> float:
-    if ion.size < 8:
-        return 0.0
-    az, el = azel
-    psi = 0.0137 / (el / math.pi + 0.11) - 0.022
-    phi = pos[0] / math.pi + psi * math.cos(az)
-    phi = min(max(phi, -0.416), 0.416)
-    lam = pos[1] / math.pi + psi * math.sin(az) / math.cos(phi * math.pi)
-    t = 43200.0 * lam + datetime_to_gps_seconds(time) % 86400.0
-    t %= 86400.0
-    s_arg = 1.57 - 1.634 * el / math.pi
-    a = ion[0] + ion[1] * phi + ion[2] * phi**2 + ion[3] * phi**3
-    a = max(a, 0.0)
-    b = ion[4] + ion[5] * phi + ion[6] * phi**2 + ion[7] * phi**3
-    b = max(b, 72000.0)
-    x = 2.0 * math.pi * (t - 50400.0) / b
+def iono_free(C1:float, C2:float) -> Optional[float]:
+    if not (np.isfinite(C1) and np.isfinite(C2)): return None
+    f1=F_L1; f2=F_L2; g=(f1/f2)**2
+    return (g*C1 - C2)/(g-1.0)
+
+def klobuchar_delay(nav_header:NavHeader, t_gps:float, lat:float, lon:float, az:float, el:float, freq=F_L1) -> float:
+    if not nav_header.ion_alpha or not nav_header.ion_beta or el<=0: return 0.0
+    alpha=nav_header.ion_alpha; beta=nav_header.ion_beta
+    psi = 0.0137/(el/math.pi + 0.11) - 0.022
+    phi_i = lat/math.pi + psi*math.cos(az); phi_i = max(-0.416, min(0.416, phi_i))
+    lam_i = lon/math.pi + psi*math.sin(az)/math.cos(phi_i*math.pi)
+    phi_m = phi_i + 0.064*math.cos((lam_i-1.617)*math.pi)
+    t = (t_gps%86400.0) + 43200.0*lam_i/0.5  # 4.32e4*lam_i
+    t = t % 86400.0
+    AMP = alpha[0] + alpha[1]*phi_m + alpha[2]*phi_m**2 + alpha[3]*phi_m**3
+    PER = beta[0] + beta[1]*phi_m + beta[2]*phi_m**2 + beta[3]*phi_m**3
+    AMP=max(0.0,AMP); PER=max(72000.0,PER)
+    x = 2*math.pi*(t-50400.0)/PER
+    Fm = 1.0 + 16.0*(0.53 - el/math.pi)**3
     if abs(x) < 1.57:
-        ionodelay = (5e-9 + a * (1.0 - x**2 / 2.0 + x**4 / 24.0)) * (1.0 + 0.1 * (0.53 - s_arg)**2)
+        iono = Fm * (5e-9 + AMP*(1 - x*x/2 + x**4/24.0))
     else:
-        ionodelay = 5e-9 * (1.0 + 0.1 * (0.53 - s_arg)**2)
-    return CLIGHT * ionodelay
+        iono = Fm * 5e-9
+    iono_sec = iono * (F_L1/freq)**2
+    return iono_sec * C
 
-def tropmodel(time: dt.datetime, pos: Sequence[float], azel: Sequence[float], rel_humi: float) -> float:
-    lat, _, h = pos
-    el = azel[1]
-    P0 = 1013.25
-    T0 = 15.0 + 273.15
-    e0 = 6.108 * rel_humi * math.exp((17.15 * (T0 - 273.15) - 38.25) / (T0 - 273.15 + 273.15))
-    z = math.pi / 2.0 - el
-    trop = 0.0022768 * P0 / (1.0 - 0.00266 * math.cos(2.0 * lat) - 0.00028 * h / 1000.0) / math.cos(z)
-    wet = 0.002277 * (1255.0 / T0 + 0.05) * e0 / math.cos(z)
-    return trop + wet
+def saastamoinen_zenith_dry(lat:float, h:float) -> float:
+    # standard atmosphere
+    p = 1013.25 * (1 - 2.2557e-5 * h)**5.2568
+    return 0.0022768 * p / (1 - 0.00266*math.cos(2*lat) - 0.00028e-3*h)
 
-def sbsioncorr(*args, **kwargs) -> bool:
-    return False
+def saastamoinen_zenith_wet(lat:float, h:float, rh=0.5) -> float:
+    T_c = 15.0 - 0.0065*h; T_k=T_c+273.15
+    es = 6.108*math.exp((17.15*T_c)/(234.7+T_c))
+    e = rh*es
+    return 0.002277 * (1255.0/T_k + 0.05) * e
 
-def iontec(*args, **kwargs) -> bool:
-    return False
+def niell_mapping(lat:float, h:float, el:float) -> Tuple[float,float]:
+    sin_el=math.sin(el)
+    ah=0.0012769934; bh=0.0029153695; ch=0.062610505
+    aw=0.0005; bw=0.001; cw=0.04391
+    mfh=(1+ah/(1+bh/(1+ch)))/(sin_el + ah/(sin_el+bh/(sin_el+ch)))
+    mfw=(1+aw/(1+bw/(1+cw)))/(sin_el + aw/(sin_el+bw/(sin_el+cw)))
+    return mfh, mfw
 
-def sbstropcorr(*args, **kwargs) -> float:
-    return 0.0
+# ----------------------------
+# DOP computation
+# ----------------------------
+def compute_dops(H_geo: np.ndarray) -> Dict[str, float]:
+    # H_geo: Nx4 with columns [ux, uy, uz, 1] (clock)
+    Q = np.linalg.inv(H_geo.T @ H_geo)
+    GDOP = math.sqrt(np.trace(Q))
+    PDOP = math.sqrt(Q[0,0] + Q[1,1] + Q[2,2])
+    HDOP = math.sqrt(Q[0,0] + Q[1,1])
+    VDOP = math.sqrt(Q[2,2])
+    TDOP = math.sqrt(Q[3,3])
+    return dict(GDOP=GDOP, PDOP=PDOP, HDOP=HDOP, VDOP=VDOP, TDOP=TDOP)
 
-# ---------------------------------------------------------------------------
-# Auxiliary helpers
-# ---------------------------------------------------------------------------
-
-def testsnr(mode: int, freq: int, el: float, snr: float, mask: SNRMask) -> bool:
-    if mask.ena[mode] == 0:
-        return False
-    idx = min(int(max((el * R2D) // 5, 0)), 10)
-    threshold = mask.mask[freq, idx]
-    if threshold <= 0.0:
-        return False
-    return snr < threshold
-
-def sat2freq(sat: int, code: str, nav: NavigationData) -> float:
-    sys, prn = satsys(sat)
-    if sys == SYS_GPS or sys == SYS_SBS:
-        if code.startswith(("C1", "P1", "L1", "S1", "D1")):
-            return FREQ_GPS_L1
-        if code.startswith(("C2", "P2", "L2", "S2", "D2")):
-            return FREQ_GPS_L2
-        if code.startswith(("C5", "L5", "D5", "S5")):
-            return FREQ_GPS_L5
-    if sys == SYS_GAL:
-        if code.startswith(("C1", "L1", "D1", "S1")):
-            return FREQ_GAL_E1
-        if code.startswith(("C5", "L5", "D5", "S5")):
-            return FREQ_GAL_E5a
-        if code.startswith(("C7", "L7", "D7", "S7")):
-            return FREQ_GAL_E5b
-    if sys == SYS_CMP:
-        if code.startswith(("C2", "L2", "D2", "S2")):
-            return FREQ_CMP_B1I
-        if code.startswith(("C7", "L7", "D7", "S7")):
-            return FREQ_CMP_B2I
-        if code.startswith(("C6", "L6", "D6", "S6")):
-            return FREQ_CMP_B3
-    if sys == SYS_QZS:
-        if code.startswith(("C1", "L1", "D1", "S1")):
-            return FREQ_QZS_L1
-        if code.startswith(("C2", "L2", "D2", "S2")):
-            return FREQ_QZS_L2
-        if code.startswith(("C5", "L5", "D5", "S5")):
-            return FREQ_QZS_L5
-        if code.startswith(("C6", "L6", "D6", "S6")):
-            return FREQ_QZS_LEX
-    if sys == SYS_IRN:
-        if code.startswith(("C5", "L5", "D5", "S5")):
-            return FREQ_IRN_L5
-        if code.startswith(("C9", "L9", "D9", "S9")):
-            return FREQ_IRN_S
-    if sys == SYS_GLO:
-        freq_slot = prn - 1
-        if code.startswith(("C1", "L1", "D1", "S1")):
-            return FREQ_GLO_G1 + freq_slot * DFRQ1_GLO
-        if code.startswith(("C2", "L2", "D2", "S2")):
-            return FREQ_GLO_G2 + freq_slot * DFRQ2_GLO
-        if code.startswith(("C3", "L3", "D3", "S3")):
-            return FREQ_GLO_G3
-    raise ValueError(f"Unsupported code {code} for sat {sat}")
-
-def seliflc(nf: int, sys: int) -> int:
-    if nf < 2:
-        return 0
-    return 1
-
-def code2bias_ix(sys: int, code: str) -> int:
-    return 0
-
-def getseleph(sys: int) -> bool:
-    return sys == SYS_GAL
-
-def satexclude(sat: int, vare: float, svh: int, opt: ProcOptions) -> bool:
-    return svh & SVH_UNHEALTHY
-
-# ---------------------------------------------------------------------------
-# Range and variance helpers
-# ---------------------------------------------------------------------------
-
-def varerr(opt: ProcOptions, obs: Observation, el: float, sys: int) -> float:
-    fact = {
-        SYS_GPS: 1.0,
-        SYS_GLO: 1.5,
-        SYS_SBS: 3.0,
-        SYS_CMP: 1.1,
-        SYS_QZS: 1.2,
-        SYS_IRN: 1.0
-    }.get(sys, 1.0)
-    el = max(el, MIN_EL)
-    varr = SQR(opt.err[1]) + SQR(opt.err[2]) / math.sin(el)
-    if opt.err[6] > 0.0:
-        snr = obs.SNR[0] if obs.SNR.size else 0.0
-        varr += SQR(opt.err[6]) * 10 ** (0.1 * max(opt.err[5] - snr, 0.0))
-    varr *= SQR(opt.eratio[0])
-    if opt.err[7] > 0.0:
-        pstd = obs.Pstd[0] if obs.Pstd.size else 0.0
-        varr += SQR(opt.err[7] * pstd)
-    if opt.ionoopt == IONOOPT_IFLC:
-        varr *= SQR(3.0)
-    return SQR(fact) * varr
-
-def gettgd(sat: int, nav: NavigationData, type_idx: int) -> float:
-    if sat not in nav.cbias:
-        return 0.0
-    arr = nav.cbias[sat]
-    if type_idx < arr.size:
-        return arr[type_idx]
-    return 0.0
-
-# ---------------------------------------------------------------------------
-# Measurement models
-# ---------------------------------------------------------------------------
-
-def snrmask(obs: Observation, azel: Sequence[float], opt: ProcOptions) -> bool:
-    if testsnr(0, 0, azel[1], obs.SNR[0] if obs.SNR.size else 0.0, opt.snrmask):
-        return False
-    if opt.ionoopt == IONOOPT_IFLC and opt.nf > 1:
-        f2 = seliflc(opt.nf, satsys(obs.sat)[0])
-        if obs.SNR.size > f2 and testsnr(0, f2, azel[1], obs.SNR[f2], opt.snrmask):
-            return False
-    return True
-
-def prange(obs: Observation, nav: NavigationData, opt: ProcOptions) -> Tuple[float, float]:
-    P1 = obs.P[0] if obs.P.size else 0.0
-    var = 0.0
-    if P1 == 0.0:
-        return 0.0, var
-    sys, _ = satsys(obs.sat)
-    if opt.ionoopt == IONOOPT_IFLC and opt.nf > 1:
-        f2 = seliflc(opt.nf, sys)
-        if obs.P.size <= f2 or obs.P[f2] == 0.0:
-            return 0.0, var
-        P2 = obs.P[f2]
-        freq1 = sat2freq(obs.sat, obs.code[0], nav)
-        freq2 = sat2freq(obs.sat, obs.code[f2], nav)
-        gamma = SQR(freq1 / freq2)
-        if abs(1.0 - gamma) < 1e-12:
-            return 0.0, var
-        return ((P2 - gamma * P1) / (1.0 - gamma)), var
-    var = SQR(ERR_CBIAS)
-    if sys in (SYS_GPS, SYS_QZS):
-        return P1 - gettgd(obs.sat, nav, 0), var
-    if sys == SYS_GAL:
-        return P1 - gettgd(obs.sat, nav, 0), var
-    if sys == SYS_CMP:
-        return P1 - gettgd(obs.sat, nav, 0), var
-    if sys == SYS_IRN:
-        freq = sat2freq(obs.sat, obs.code[0], nav)
-        return P1 - (freq / FREQ_IRN_L5) * gettgd(obs.sat, nav, 0), var
-    if sys == SYS_GLO:
-        return P1, var
-    return P1, var
-
-def ionocorr(time: dt.datetime, nav: NavigationData, sat: int, pos: Sequence[float],
-             azel: Sequence[float], ionoopt: int) -> Tuple[float, float, bool]:
-    err = False
-    if ionoopt == IONOOPT_SBAS and sbsioncorr(time, nav, pos, azel, None, None):
-        return 0.0, 0.0, True
-    if ionoopt == IONOOPT_TEC and iontec(time, nav, pos, azel, 1, None, None):
-        return 0.0, 0.0, True
-    if ionoopt == IONOOPT_QZS and np.linalg.norm(nav.ion_qzs) > 0.0:
-        ion = ionmodel(time, nav.ion_qzs, pos, azel)
-        return ion, SQR(ion * ERR_BRDCI), True
-    if ionoopt in (IONOOPT_BRDC, IONOOPT_SBAS, IONOOPT_TEC, IONOOPT_QZS):
-        ion = ionmodel(time, nav.ion_gps, pos, azel)
-        return ion, SQR(ion * ERR_BRDCI), True
-    return 0.0, (SQR(ERR_ION) if ionoopt == IONOOPT_OFF else 0.0), True
-
-def tropcorr(time: dt.datetime, nav: NavigationData, pos: Sequence[float],
-             azel: Sequence[float], tropopt: int) -> Tuple[float, float, bool]:
-    if tropopt in (TROPOPT_SAAS, TROPOPT_EST, TROPOPT_ESTG):
-        trp = tropmodel(time, pos, azel, REL_HUMI)
-        return trp, SQR(ERR_SAAS / (math.sin(azel[1]) + 0.1)), True
-    if tropopt == TROPOPT_SBAS:
-        trp = sbstropcorr(time, pos, azel, None)
-        return trp, SQR(0.12), True
-    return 0.0, (SQR(ERR_TROP) if tropopt == TROPOPT_OFF else 0.0), True
-
-# ---------------------------------------------------------------------------
-# Satellite position from ephemeris
-# ---------------------------------------------------------------------------
-
-def check_t(t: float) -> float:
-    half_week = 302400.0
-    if t > half_week:
-        t -= 604800.0
-    elif t < -half_week:
-        t += 604800.0
-    return t
-
-def eph2pos(time: dt.datetime, eph: BroadcastEphemeris) -> Tuple[np.ndarray, np.ndarray, float]:
-    tk = check_t(datetime_to_gps_seconds(time) - eph.toe)
-    n0 = math.sqrt(MU_GPS / eph.A**3)
-    n = n0 + eph.deltan
-    M = eph.M0 + n * tk
-    E = M
-    for _ in range(10):
-        Ek = E
-        E = M + eph.e * math.sin(E)
-        if abs(E - Ek) < 1e-12:
-            break
-    sinE, cosE = math.sin(E), math.cos(E)
-    v = math.atan2(math.sqrt(1.0 - eph.e**2) * sinE, cosE - eph.e)
-    phi = v + eph.omg
-    du = eph.Cus * math.sin(2.0 * phi) + eph.Cuc * math.cos(2.0 * phi)
-    dr = eph.Crs * math.sin(2.0 * phi) + eph.Crc * math.cos(2.0 * phi)
-    di = eph.Cis * math.sin(2.0 * phi) + eph.Cic * math.cos(2.0 * phi)
-    u = phi + du
-    r = eph.A * (1.0 - eph.e * cosE) + dr
-    i = eph.i0 + di + eph.idot * tk
-    x_orb = r * math.cos(u)
-    y_orb = r * math.sin(u)
-    OMG = eph.OMG0 + (eph.OMGd - OMGE) * tk - OMGE * eph.toe
-    sinOMG, cosOMG = math.sin(OMG), math.cos(OMG)
-    sinI, cosI = math.sin(i), math.cos(i)
-    pos = np.array([
-        x_orb * cosOMG - y_orb * cosI * sinOMG,
-        x_orb * sinOMG + y_orb * cosI * cosOMG,
-        y_orb * sinI
-    ], dtype=float)
-    rel = -2.0 * math.sqrt(MU_GPS * eph.A) * eph.e * sinE / CLIGHT
-    dt_clk = eph.af0 + eph.af1 * tk + eph.af2 * tk * tk + rel - eph.tgd[0]
-    tk_dot = 1e-3
-    pos2, _, _ = eph2pos_raw(time + dt.timedelta(seconds=tk_dot), eph)
-    vel = (pos2 - pos) / tk_dot
-    return pos, vel, dt_clk
-
-def eph2pos_raw(time: dt.datetime, eph: BroadcastEphemeris) -> Tuple[np.ndarray, float, float]:
-    tk = check_t(datetime_to_gps_seconds(time) - eph.toe)
-    n0 = math.sqrt(MU_GPS / eph.A**3)
-    n = n0 + eph.deltan
-    M = eph.M0 + n * tk
-    E = M
-    for _ in range(10):
-        Ek = E
-        E = M + eph.e * math.sin(E)
-        if abs(E - Ek) < 1e-12:
-            break
-    sinE, cosE = math.sin(E), math.cos(E)
-    v = math.atan2(math.sqrt(1.0 - eph.e**2) * sinE, cosE - eph.e)
-    phi = v + eph.omg
-    du = eph.Cus * math.sin(2.0 * phi) + eph.Cuc * math.cos(2.0 * phi)
-    dr = eph.Crs * math.sin(2.0 * phi) + eph.Crc * math.cos(2.0 * phi)
-    di = eph.Cis * math.sin(2.0 * phi) + eph.Cic * math.cos(2.0 * phi)
-    u = phi + du
-    r = eph.A * (1.0 - eph.e * cosE) + dr
-    i = eph.i0 + di + eph.idot * tk
-    x_orb = r * math.cos(u)
-    y_orb = r * math.sin(u)
-    OMG = eph.OMG0 + (eph.OMGd - OMGE) * tk - OMGE * eph.toe
-    sinOMG, cosOMG = math.sin(OMG), math.cos(OMG)
-    sinI, cosI = math.sin(i), math.cos(i)
-    pos = np.array([
-        x_orb * cosOMG - y_orb * cosI * sinOMG,
-        x_orb * sinOMG + y_orb * cosI * cosOMG,
-        y_orb * sinI
-    ], dtype=float)
-    rel = -2.0 * math.sqrt(MU_GPS * eph.A) * eph.e * sinE / CLIGHT
-    dt_clk = eph.af0 + eph.af1 * tk + eph.af2 * tk * tk + rel - eph.tgd[0]
-    return pos, dt_clk, tk
-
-def satposs(time: dt.datetime, obs: List[Observation], nav: NavigationData,
-            sateph: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    n = len(obs)
-    rs = np.zeros((n, 6))
-    dts = np.zeros((n, 2))
-    var = np.zeros(n)
-    svh = np.zeros(n, dtype=int)
-    for i, ob in enumerate(obs):
-        ephs = nav.eph.get(ob.sat, [])
-        if not ephs:
-            svh[i] = SVH_UNHEALTHY
-            continue
-        eph = min(ephs, key=lambda e: abs(check_t(datetime_to_gps_seconds(time) - e.toe)))
-        pos, vel, clk = eph2pos(ob.time, eph)
-        rs[i, :3] = pos
-        rs[i, 3:] = vel
-        dts[i, 0] = clk
-        dts[i, 1] = eph.af1
-        var[i] = 1e-6
-        svh[i] = eph.svh
-    return rs, dts, var, svh
-
-# ---------------------------------------------------------------------------
-# Residuals and estimation
-# ---------------------------------------------------------------------------
-
-def rescode(iteration: int, obs: List[Observation], rs: np.ndarray, dts: np.ndarray,
-            vare: np.ndarray, svh: np.ndarray, nav: NavigationData, x: np.ndarray,
-            opt: ProcOptions, ssat: Dict[int, SatelliteStatus], v: np.ndarray,
-            H: np.ndarray, var: np.ndarray, azel: np.ndarray, vsat: np.ndarray,
-            resp: np.ndarray) -> Tuple[int, int]:
-    rr = x[:3]
-    dtr = x[3]
-    pos = ecef2pos(rr)
-    nv = 0
-    ns = 0
-    mask = np.zeros(NX - 3, dtype=int)
-    for i, ob in enumerate(obs):
-        vsat[i] = 0
-        azel[2 * i:2 * i + 2] = 0.0
-        resp[i] = 0.0
-        sat = ob.sat
-        sys, _ = satsys(sat)
-        if satexclude(sat, vare[i], svh[i], opt):
-            continue
-        r, e = geodist(rs[i], rr)
-        if r <= 0.0:
-            continue
-        el = satazel(pos, e)
-        az = math.atan2(e[0], e[1])
-        azel[2 * i] = az
-        azel[2 * i + 1] = el
-        if el < opt.elmin:
-            continue
-        if iteration > 0:
-            if not snrmask(ob, azel[2 * i:2 * i + 2], opt):
-                continue
-            dion, vion, ok = ionocorr(ob.time, nav, sat, pos, azel[2 * i:2 * i + 2], opt.ionoopt)
-            if not ok:
-                continue
-            freq = sat2freq(sat, ob.code[0], nav)
-            dion *= SQR(FREQ_GPS_L1 / freq)
-            vion *= SQR(SQR(FREQ_GPS_L1 / freq))
-            dtrp, vtrp, ok = tropcorr(ob.time, nav, pos, azel[2 * i:2 * i + 2], opt.tropopt)
-            if not ok:
-                continue
-        else:
-            dion = vion = dtrp = vtrp = 0.0
-        P, vmeas = prange(ob, nav, opt)
-        if P == 0.0:
-            continue
-        v[nv] = P - (r + dtr - CLIGHT * dts[i, 0] + dion + dtrp)
-        for j in range(NX):
-            H[nv, j] = (-e[j] if j < 3 else (1.0 if j == 3 else 0.0))
-        if sys == SYS_GLO:
-            v[nv] -= x[4]; H[nv, 4] = 1.0; mask[1] = 1
-        elif sys == SYS_GAL:
-            v[nv] -= x[5]; H[nv, 5] = 1.0; mask[2] = 1
-        elif sys == SYS_CMP:
-            v[nv] -= x[6]; H[nv, 6] = 1.0; mask[3] = 1
-        elif sys == SYS_IRN:
-            v[nv] -= x[7]; H[nv, 7] = 1.0; mask[4] = 1
-        elif sys == SYS_QZS:
-            v[nv] -= x[8]; H[nv, 8] = 1.0; mask[5] = 1
-        else:
-            mask[0] = 1
-        vsat[i] = 1
-        resp[i] = v[nv]
-        var[nv] = vare[i] + vmeas + vion + vtrp + varerr(opt, ob, el, sys)
-        nv += 1
-        ns += 1
-    for i in range(NX - 3):
-        if mask[i]:
-            continue
-        H[nv, :] = 0.0
-        H[nv, i + 3] = 1.0
-        v[nv] = 0.0
-        var[nv] = 0.01
-        nv += 1
-    return nv, ns
-
-def valsol(azel: np.ndarray, vsat: np.ndarray, n: int, opt: ProcOptions,
-           v: np.ndarray, nv: int, nx: int) -> bool:
-    vv = dot(v[:nv], v[:nv])
-    if nv > nx and nv - nx - 1 < len(CHISQR):
-        if vv > CHISQR[nv - nx - 1]:
-            pass
-    azels = []
-    for i in range(n):
-        if vsat[i]:
-            azels.extend(azel[2 * i:2 * i + 2])
-    if len(azels) < 2:
-        return False
-    dop = np.zeros(4)
-    dops(len(azels) // 2, np.array(azels), opt.elmin, dop)
-    if dop[0] <= 0.0 or dop[0] > MAX_GDOP:
-        return False
-    return True
-
-def estpos(obs: List[Observation], rs: np.ndarray, dts: np.ndarray, vare: np.ndarray,
-           svh: np.ndarray, nav: NavigationData, opt: ProcOptions, ssat: Dict[int, SatelliteStatus],
-           sol: Solution, azel_out: np.ndarray, vsat: np.ndarray, resp: np.ndarray,
-           msg: List[str]) -> int:
-    x = np.zeros(NX)
-    x[:3] = sol.rr[:3]
-    v = np.zeros(len(obs) + NX)
-    H = np.zeros((len(obs) + NX, NX))
-    var = np.zeros(len(obs) + NX)
-    ns_sum = 0
-    for itr in range(MAXITR):
-        nv, ns = rescode(itr, obs, rs, dts, vare, svh, nav, x, opt, ssat, v, H, var, azel_out, vsat, resp)
-        if nv < NX:
-            msg.append(f"lack of valid sats ns={nv}")
-            break
-        for j in range(nv):
-            sig = math.sqrt(var[j])
-            v[j] /= sig
-            H[j, :] /= sig
-        dx, _, Q = lsq(H, v, NX, nv)
-        x[:NX] += dx
-        if norm(dx) < 1e-4:
-            sol.type = 0
-            sol.time = timeadd(obs[0].time, -x[3] / CLIGHT)
-            sol.dtr[:6] = x[3:9] / CLIGHT
-            sol.rr[:3] = x[:3]
-            sol.rr[3:] = 0.0
-            sol.qr[0] = Q[0, 0]
-            sol.qr[1] = Q[1, 1]
-            sol.qr[2] = Q[2, 2]
-            sol.qr[3] = Q[0, 1]
-            sol.qr[4] = Q[1, 2]
-            sol.qr[5] = Q[0, 2]
-            sol.ns = ns
-            sol.age = 0.0
-            sol.ratio = 0.0
-            if valsol(azel_out, vsat, len(obs), opt, v, nv, NX):
-                sol.stat = SOLQ_SINGLE if opt.sateph != EPHOPT_SBAS else SOLQ_SBAS
-                return 1
-            return 0
-        ns_sum = ns
-    msg.append("iteration divergent")
-    return 0
-
-def resdop(obs: List[Observation], rs: np.ndarray, dts: np.ndarray, nav: NavigationData,
-           rr: np.ndarray, x: np.ndarray, azel: np.ndarray, vsat: np.ndarray,
-           err: float, v: np.ndarray, H: np.ndarray) -> int:
-    pos = ecef2pos(rr[:3])
-    E = xyz2enu(pos)
-    nv = 0
-    for i, ob in enumerate(obs):
-        if ob.D.size == 0 or not vsat[i]:
-            continue
-        freq = sat2freq(ob.sat, ob.code[0], nav)
-        if freq == 0.0 or norm(rs[i, 3:]) <= 0.0:
-            continue
-        az = azel[2 * i]
-        el = azel[2 * i + 1]
-        cosel = math.cos(el)
-        a = np.array([math.sin(az) * cosel, math.cos(az) * cosel, math.sin(el)])
-        e = E.T @ a
-        vs = rs[i, 3:] - x[:3]
-        rate = dot3(vs, e) + OMGE / CLIGHT * (
-            rs[i, 4] * rr[0] + rs[i, 1] * x[0] - rs[i, 3] * rr[1] - rs[i, 0] * x[1]
-        )
-        sig = err * CLIGHT / freq if err > 0.0 else 1.0
-        v[nv] = (-ob.D[0] * CLIGHT / freq - (rate + x[3] - CLIGHT * dts[i, 1])) / sig
-        H[nv, :3] = -e / sig
-        H[nv, 3] = 1.0 / sig
-        nv += 1
-    return nv
-
-def estvel(obs: List[Observation], rs: np.ndarray, dts: np.ndarray, nav: NavigationData,
-           opt: ProcOptions, sol: Solution, azel: np.ndarray, vsat: np.ndarray) -> None:
-    x = np.zeros(4)
-    v = np.zeros(len(obs))
-    H = np.zeros((len(obs), 4))
-    err = opt.err[4]
-    for _ in range(MAXITR):
-        nv = resdop(obs, rs, dts, nav, sol.rr, x, azel, vsat, err, v, H)
-        if nv < 4:
-            break
-        dx, _, Q = lsq(H, v, 4, nv)
+# ----------------------------
+# Core SPP epoch solver
+# ----------------------------
+def spp_epoch_wls(epoch:ObsEpoch, nav_header:NavHeader, ephs:Dict[str,List[Eph]],
+                  x0:np.ndarray, elev_mask_deg=10.0, est_zwd=False) -> Tuple[np.ndarray, float, Dict[str,float], Dict[str,float], np.ndarray]:
+    """
+    Returns:
+      x_est (state [X,Y,Z,dt,(ZWD)]),
+      rms [m],
+      residuals_by_sat {prn: v},
+      dops {GDOP,PDOP,HDOP,VDOP,TDOP},
+      H_geo (design for DOP)
+    """
+    x = x0.copy()
+    for it in range(10):
+        A=[]; L=[]; W=[]; res_by_sat={}
+        H_geo_rows=[]
+        lat,lon,h = ecef_to_llh(x[:3])
+        for prn in epoch.sats:
+            if prn[0] != 'G': continue
+            if prn not in ephs: continue
+            eph = min(ephs[prn], key=lambda e: abs(time_diff_gps(epoch.t_gps, e.toe)))
+            # pick observations
+            types = epoch.types_G
+            vals = epoch.data.get(prn, [])
+            def pick(names):
+                for name in names:
+                    if name in types:
+                        idx = types.index(name)
+                        return vals[idx]
+                return float('nan')
+            C1 = pick(['C1C','C1W','C1P','C1X','C1S','C1L','C1Z'])
+            C2 = pick(['C2W','C2P','C2C','C2X','C2S','C2L','C2Z'])
+            # Build pseudorange
+            P_if = iono_free(C1,C2) if (np.isfinite(C1) and np.isfinite(C2)) else None
+            use_IF = P_if is not None
+            P = P_if if use_IF else C1
+            if not np.isfinite(P): continue
+            # iterate transmit time
+            # initial tx
+            r_sv, dt_sv = kepler_orbit(eph, epoch.t_gps)
+            rho = np.linalg.norm(r_sv - x[:3])
+            t_tx = epoch.t_gps - P/C
+            r_sv, dt_sv = kepler_orbit(eph, t_tx)
+            sag = sagnac_correction(r_sv, x[:3])
+            rho = np.linalg.norm(r_sv - x[:3])
+            # elevation mask
+            az, el, _ = az_el(x[:3], r_sv)
+            if math.degrees(el) < elev_mask_deg: continue
+            # atmos
+            mfh, mfw = niell_mapping(lat,h,el)
+            trop = saastamoinen_zenith_dry(lat,h)*mfh
+            if est_zwd:
+                trop += x[4]*mfw
+            else:
+                trop += saastamoinen_zenith_wet(lat,h)*mfw
+            iono = 0.0 if use_IF else klobuchar_delay(nav_header, epoch.t_gps, lat, lon, az, el, F_L1)
+            modeled = rho + C*(x[3] - dt_sv) + sag + trop + iono
+            v = P - modeled
+            u = (x[:3] - r_sv)/rho
+            H = np.zeros(5 if est_zwd else 4)
+            H[0:3] = u
+            H[3] = C
+            if est_zwd: H[4] = -mfw
+            # weight by elevation
+            sigma = 0.5 + 3.0/(max(math.sin(el),1e-3)**2)
+            w = 1.0/sigma**2
+            A.append(H); L.append(v); W.append(w)
+            res_by_sat[prn]=v
+            # H for DOP (geometry-only)
+            H_geo_rows.append([u[0],u[1],u[2],1.0])
+        mreq = 5 if est_zwd else 4
+        if len(A) < mreq:  # not enough
+            return x, float('nan'), {}, {}, np.zeros((0,4))
+        A = np.vstack(A)
+        L = np.array(L).reshape(-1,1)
+        Wm = np.diag(W)
+        N = A.T @ Wm @ A
+        U = A.T @ Wm @ L
+        try:
+            dx = np.linalg.solve(N,U).flatten()
+        except np.linalg.LinAlgError:
+            dx = np.linalg.lstsq(N,U,rcond=None)[0].flatten()
         x[:4] += dx[:4]
-        if norm(dx) < 1e-6:
-            sol.rr[3:6] = x[:3]
-            sol.qv[0] = Q[0, 0]
-            sol.qv[1] = Q[1, 1]
-            sol.qv[2] = Q[2, 2]
-            sol.qv[3] = Q[0, 1]
-            sol.qv[4] = Q[1, 2]
-            sol.qv[5] = Q[0, 2]
-            break
+        if est_zwd and len(dx)==5:
+            x[4] += dx[4]
+        if np.linalg.norm(dx[:4]) < 1e-4 and (not est_zwd or abs(dx[-1])<1e-3):
+            # RMS of residuals
+            v = (L - A @ dx.reshape(-1,1))
+            dof = max(1, len(L) - mreq)
+            rms = math.sqrt(float((v.T @ Wm @ v)/dof))
+            H_geo = np.array(H_geo_rows)
+            dops = compute_dops(H_geo) if H_geo.shape[0] >= 4 else {}
+            return x, rms, res_by_sat, dops, H_geo
+    # not converged
+    H_geo = np.array(H_geo_rows) if 'H_geo_rows' in locals() else np.zeros((0,4))
+    dops = compute_dops(H_geo) if H_geo.shape[0] >= 4 else {}
+    return x, float('nan'), res_by_sat, dops, H_geo
 
-def raim_fde(*args, **kwargs) -> int:
-    return 0  # Full RAIM FDE requires replicated subset; placeholder keeps flow identical.
+# ----------------------------
+# ENU errors and summary
+# ----------------------------
+def enu_from_ref(x_ecef:np.ndarray, ref_llh:Tuple[float,float,float]) -> np.ndarray:
+    lat,lon,h = ref_llh
+    E = ecef_to_enu_matrix(lat,lon)
+    ref_ecef = llh_to_ecef(lat,lon,h)
+    enu = E @ (x_ecef - ref_ecef)
+    return enu
 
-def pntpos(obs: List[Observation], nav: NavigationData, opt: ProcOptions,
-           sol: Solution, azel: np.ndarray, ssat: Dict[int, SatelliteStatus],
-           msg: List[str]) -> int:
-    if not obs:
-        msg.append("no observation data")
-        print("No observation data available")
-        return 0
-    sol.time = obs[0].time
-    sol.eventime = obs[0].eventime
-    rs, dts, var, svh = satposs(sol.time, obs, nav, opt.sateph)
-    vsat = np.zeros(len(obs), dtype=int)
-    resp = np.zeros(len(obs))
-    stat = estpos(obs, rs, dts, var, svh, nav, opt, ssat, sol, azel, vsat, resp, msg)
-    if not stat and len(obs) >= 6 and opt.posopt[4]:
-        print(f"Positioning failed: {msg}")
-        stat = raim_fde(obs, len(obs), rs, dts, var, svh, nav, opt, ssat, sol, azel, vsat, resp, msg)
-    if stat:
-        estvel(obs, rs, dts, nav, opt, sol, azel, vsat)
-    return stat
+# ----------------------------
+# Driver
+# ----------------------------
+def run(obs_path:str, nav_path:str, elev_mask:float=10.0, est_trop:bool=False,
+        ref_lat:Optional[float]=None, ref_lon:Optional[float]=None, ref_h:Optional[float]=None):
+    nav_header, ephs = parse_rinex3_nav(nav_path)
+    types_G, epochs = parse_rinex3_obs(obs_path)
 
-# ---------------------------------------------------------------------------
-# RINEX parsing
-# ---------------------------------------------------------------------------
+    # Initial state
+    x_state = np.zeros(5 if est_trop else 4)
+    x_state[:3] = llh_to_ecef(0.0,0.0,0.0)
+    x_state[3] = 0.0
+    if est_trop: x_state[4] = 0.1
 
-def parse_rinex_obs(path: pathlib.Path) -> List[Observation]:
-    ds = gr.load(path)
-    time_values = ds.time.values
-    obs_list: List[Observation] = []
-    for t_idx, t_val in enumerate(time_values):
-        epoch = pd.to_datetime(str(t_val)).to_pydatetime().replace(tzinfo=dt.timezone.utc)
-        for sv in ds.sv.values:
-            if np.all(np.isnan(ds.sel(sv=sv).to_array().values[:, t_idx])):
-                continue
-            system_char = sv[0]
-            prn = int(sv[1:])
-            sys = SYS_CHAR.get(system_char)
-            if sys is None:
-                continue
-            sat = satno(sys, prn)
-            codes = []
-            P = []
-            L = []
-            D = []
-            SNR = []
-            Pstd = []
-            for obs_type in ds.data_vars:
-                field = ds[obs_type]
-                val = field.sel(time=t_val, sv=sv).item()
-                if np.isnan(val):
-                    continue
-                if obs_type.startswith('C'):
-                    codes.append(obs_type)
-                    P.append(val)
-                elif obs_type.startswith('L'):
-                    L.append(val)
-                elif obs_type.startswith('D'):
-                    D.append(val)
-                elif obs_type.startswith('S'):
-                    SNR.append(val)
-            P_arr = np.array(P) if P else np.zeros(0)
-            if P_arr.size == 0:
-                continue
-            while len(codes) < opt_default().nf:
-                codes.append(codes[-1])
-                P_arr = np.pad(P_arr, (0, 1), 'edge')
-            obs_list.append(Observation(
-                time=epoch,
-                sat=sat,
-                code=codes,
-                P=P_arr,
-                L=np.array(L) if L else np.zeros(0),
-                D=np.array(D) if D else np.zeros(0),
-                SNR=np.array(SNR) if SNR else np.zeros(opt_default().nf),
-                Pstd=np.array(Pstd) if Pstd else np.zeros(opt_default().nf),
-                eventime=datetime_to_gps_seconds(epoch)
-            ))
-    obs_list.sort(key=lambda o: (o.time, o.sat))
-    return obs_list
+    ref_llh = None
+    if ref_lat is not None and ref_lon is not None and ref_h is not None:
+        ref_llh = (math.radians(ref_lat), math.radians(ref_lon), ref_h)
 
-def parse_rinex_nav(path: pathlib.Path) -> NavigationData:
-    ds = gr.load(path)
-    nav = NavigationData()
-    if 'iono' in ds.attrs:
-        ion = ds.attrs['iono']
-        if 'ALPHA' in ion:
-            nav.ion_gps[:4] = np.array(ion['ALPHA'])
-        if 'BETA' in ion:
-            nav.ion_gps[4:] = np.array(ion['BETA'])
-    for sv in ds.sv.values:
-        system_char = sv[0]
-        prn = int(sv[1:])
-        sys = SYS_CHAR.get(system_char)
-        if sys is None:
+    enu_list=[]; err2d_list=[]; err3d_list=[]; dop_list=[]
+    first_ref_locked=False
+    for k, epoch in enumerate(epochs):
+        x_state, rms, res, dops, H_geo = spp_epoch_wls(epoch, nav_header, ephs, x_state, elev_mask_deg=elev_mask, est_zwd=est_trop)
+        if not np.isfinite(rms):
+            print(f"Epoch {k+1} W{epoch.week} {epoch.t_gps:8.1f}s: solution not available (nsat < req).")
             continue
-        sat = satno(sys, prn)
-        ephs: List[BroadcastEphemeris] = []
-        for t_val in ds.time.values:
-            block = ds.sel(time=t_val, sv=sv)
-            epoch = pd.to_datetime(str(t_val)).to_pydatetime().replace(tzinfo=dt.timezone.utc)
-            sqrtA = float(block['sqrtA'])
-            A = sqrtA * sqrtA
-            eph = BroadcastEphemeris(
-                sat=sat,
-                toe=datetime_to_gps_seconds(epoch),
-                toc=datetime_to_gps_seconds(epoch),
-                ttr=datetime_to_gps_seconds(epoch),
-                A=A,
-                e=float(block['e']),
-                i0=float(block['i0']),
-                OMG0=float(block['OMEGA']),
-                omg=float(block['omega']),
-                M0=float(block['M0']),
-                deltan=float(block['DeltaN']),
-                OMGd=float(block['OMEGADOT']),
-                idot=float(block['IDOT']),
-                Cuc=float(block['Cuc']),
-                Cus=float(block['Cus']),
-                Crc=float(block['Crc']),
-                Crs=float(block['Crs']),
-                Cic=float(block['Cic']),
-                Cis=float(block['Cis']),
-                af0=float(block['af0']),
-                af1=float(block['af1']),
-                af2=float(block['af2']),
-                tgd=(float(block.get('TGD', 0.0)), 0.0, 0.0, 0.0),
-                iode=int(block.get('IODE', 0)),
-                iodc=int(block.get('IODC', 0)),
-                week=int(block.get('week', 0)),
-                svh=int(block.get('svHealth', 0)),
-                ura=float(block.get('svAccuracy', 0.0)),
-                fit=int(block.get('fitInterval', 0)),
-                prn=prn,
-                sys=sys
-            )
-            ephs.append(eph)
-        nav.eph[sat] = ephs
-    return nav
+        # Establish reference if not provided: use first successful solution
+        if ref_llh is None and not first_ref_locked:
+            ref_llh = ecef_to_llh(x_state[:3])
+            first_ref_locked=True
+        enu = enu_from_ref(x_state[:3], ref_llh)
+        e,n,u = enu
+        err2d = math.hypot(e,n)
+        err3d = math.sqrt(e*e + n*n + u*u)
+        enu_list.append(enu); err2d_list.append(err2d); err3d_list.append(err3d)
+        dop_list.append(dops)
+        lat,lon,h = ecef_to_llh(x_state[:3])
+        print(f"Epoch {k+1} W{epoch.week} {epoch.t_gps:8.1f}s:"
+              f" lat={math.degrees(lat):.8f} lon={math.degrees(lon):.8f} h={h:.3f} m,"
+              f" ENU=({e:.3f},{n:.3f},{u:.3f}) m, 2D={err2d:.3f} m, 3D={err3d:.3f} m,"
+              f" RMS={rms:.3f} m,"
+              f" DOPs={{{'GDOP':{dops.get('GDOP',float('nan')):.2f},'PDOP':{dops.get('PDOP',float('nan')):.2f},'HDOP':{dops.get('HDOP',float('nan')):.2f},'VDOP':{dops.get('VDOP',float('nan')):.2f}}}}")
+    if enu_list:
+        enu_arr = np.vstack(enu_list)
+        e_rms = math.sqrt(np.mean(enu_arr[:,0]**2))
+        n_rms = math.sqrt(np.mean(enu_arr[:,1]**2))
+        u_rms = math.sqrt(np.mean(enu_arr[:,2]**2))
+        err2d_arr = np.array(err2d_list)
+        err3d_arr = np.array(err3d_list)
+        print("\nSummary (relative to reference):")
+        print(f"RMS ENU [m]: E={e_rms:.3f}, N={n_rms:.3f}, U={u_rms:.3f}")
+        print(f"2D error: mean={np.mean(err2d_arr):.3f} m, RMS={math.sqrt(np.mean(err2d_arr**2)):.3f} m, 95th={np.percentile(err2d_arr,95):.3f} m")
+        print(f"3D error: mean={np.mean(err3d_arr):.3f} m, RMS={math.sqrt(np.mean(err3d_arr**2)):.3f} m, 95th={np.percentile(err3d_arr,95):.3f} m")
+        if ref_llh is not None:
+            print(f"Reference (LLH): lat={math.degrees(ref_llh[0]):.9f}, lon={math.degrees(ref_llh[1]):.9f}, h={ref_llh[2]:.3f} m")
 
-def opt_default() -> ProcOptions:
-    return ProcOptions()
+# ----------------------------
+# 可配置的硬编码路径 (请修改为实际文件路径)
+# ----------------------------
+DEFAULT_OBS_PATH = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/20250527_PolyU_X.obs"
+DEFAULT_NAV_PATH = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/20250527_PolyU_X.nav"
+DEFAULT_ELEV_MASK = 10.0
+DEFAULT_EST_TROP = False
+# 若需要参考点, 填写 (度 / 米); 否则设为 None
+DEFAULT_REF_LAT = None   # 例如 30.0
+DEFAULT_REF_LON = None   # 例如 114.0
+DEFAULT_REF_H   = None   # 例如 50.0
 
-# ---------------------------------------------------------------------------
-# Output helpers
-# ---------------------------------------------------------------------------
-
-def write_csv(path: pathlib.Path, records: List[Dict[str, float]]) -> None:
-    df = pd.DataFrame(records)
-    df.to_csv(path, index=False)
-
-def write_kml(path: pathlib.Path, records: List[Dict[str, float]]) -> None:
-    header = """<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>
-<Placemark>
-<LineString>
-<tessellate>1</tessellate>
-<coordinates>
-"""
-    footer = """</coordinates>
-</LineString>
-</Placemark>
-</Document>
-</kml>
-"""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(header)
-        for rec in records:
-            f.write(f"{rec['lon']:.9f},{rec['lat']:.9f},{rec['height']:.3f}\n")
-        f.write(footer)
-
-# ---------------------------------------------------------------------------
-# Main processing pipeline
-# ---------------------------------------------------------------------------
-
-def run_spp(obs_path: pathlib.Path, nav_path: pathlib.Path,
-            csv_path: pathlib.Path, kml_path: pathlib.Path) -> None:
-    print(f"Processing observation file: {obs_path}")
-    print(f"Processing navigation file: {nav_path}")
-    obs_all = parse_rinex_obs(obs_path)
-    print(f"Number of observations parsed: {len(obs_all)}")
-    nav = parse_rinex_nav(nav_path)
-    print(f"Number of ephemerides parsed: {sum(len(e) for e in nav.eph.values())}")
-    opt = opt_default()
-    solutions: List[Dict[str, float]] = []
-    ssat: Dict[int, SatelliteStatus] = {i: SatelliteStatus() for i in range(MAXSAT)}
-    current_time: Optional[dt.datetime] = None
-    epoch_obs: List[Observation] = []
-    for ob in obs_all:
-        if current_time is None:
-            current_time = ob.time
-        if ob.time != current_time:
-            process_epoch(epoch_obs, nav, opt, ssat, solutions)
-            epoch_obs = []
-            current_time = ob.time
-        epoch_obs.append(ob)
-    if epoch_obs:
-        process_epoch(epoch_obs, nav, opt, ssat, solutions)
-    write_csv(csv_path, solutions)
-    write_kml(kml_path, solutions)
-    
-    print(f"Number of solutions generated: {len(solutions)}")
-    if not solutions:
-        print("No solutions to write")
-        return
-    write_csv(csv_path, solutions)
-    write_kml(kml_path, solutions)
-
-def process_epoch(obs_epoch: List[Observation], nav: NavigationData,
-                  opt: ProcOptions, ssat: Dict[int, SatelliteStatus],
-                  solutions: List[Dict[str, float]]) -> None:
-    print(f"Processing epoch with {len(obs_epoch)} observations")
-    sol = Solution()
-    azel = np.zeros(2 * len(obs_epoch))
-    msg: List[str] = []
-    stat = pntpos(obs_epoch, nav, opt, sol, azel, ssat, msg)
-    if not stat:
-        print(f"Epoch processing failed: {msg}")
-        return
-    if stat:
-        pos = ecef2pos(sol.rr[:3])
-        lat = pos[0] * R2D
-        lon = pos[1] * R2D
-        h = pos[2]
-        solutions.append({
-            "gps_week": datetime_to_gps_seconds(sol.time) / 604800.0,
-            "time": sol.time.isoformat(),
-            "lat": lat,
-            "lon": lon,
-            "height": h,
-            "stat": sol.stat,
-            "ns": sol.ns
-        })
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-DEFAULT_BASE_DIR = pathlib.Path("/Users/jay/Documents/Bachelor/aae4203")
-DEFAULT_OBS_PATH = DEFAULT_BASE_DIR / "rinex_data" / "20250527_PolyU_X.obs"
-DEFAULT_NAV_PATH = DEFAULT_BASE_DIR / "rinex_data" / "20250527_PolyU_X.nav"
-DEFAULT_OUT_CSV = DEFAULT_BASE_DIR / "output" / "solution.csv"
-DEFAULT_OUT_KML = DEFAULT_BASE_DIR / "output" / "solution.kml"
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Single Point Positioning (SPP) solver.")
-    parser.add_argument("--obs", type=pathlib.Path, default=DEFAULT_OBS_PATH,
-                        help="RINEX observation file")
-    parser.add_argument("--nav", type=pathlib.Path, default=DEFAULT_NAV_PATH,
-                        help="RINEX navigation file")
-    parser.add_argument("--out-csv", type=pathlib.Path, default=DEFAULT_OUT_CSV,
-                        help="Output CSV path")
-    parser.add_argument("--out-kml", type=pathlib.Path, default=DEFAULT_OUT_KML,
-                        help="Output KML path")
-    return parser.parse_args()
-
-def main() -> None:
-    args = parse_args()
-    run_spp(args.obs, args.nav, args.out_csv, args.out_kml)
+# ----------------------------
+# CLI (已改为直接调用)
+# ----------------------------
+def main():
+    # 直接使用上面定义的常量
+    run(
+        DEFAULT_OBS_PATH,
+        DEFAULT_NAV_PATH,
+        elev_mask=DEFAULT_ELEV_MASK,
+        est_trop=DEFAULT_EST_TROP,
+        ref_lat=DEFAULT_REF_LAT,
+        ref_lon=DEFAULT_REF_LON,
+        ref_h=DEFAULT_REF_H,
+    )
 
 if __name__ == "__main__":
     main()
