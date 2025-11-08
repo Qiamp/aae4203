@@ -15,11 +15,8 @@ Outputs:
 
 import math
 import numpy as np
-# 新增绘图库
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (仅用于注册 3D 投影)
 from matplotlib.ticker import FormatStrFormatter
-import io
 import pandas as pd
 
 # ---------------------- WGS-84 constants ----------------------
@@ -254,10 +251,10 @@ def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4):
 
     return (xr[0], xr[1], xr[2], cb), H_last, idx.size, success
 
-# 新增：误差分析计算函数
+# 误差分析计算函数
 def compute_error_statistics(ls_xyz, truth_xyz, ref_lat, ref_lon):
     """
-    计算 LS 解相对于真值的误差统计（ENU坐标系）
+    计算 LS 解相对于真值的误差统计(ENU坐标系)
     
     参数:
         ls_xyz: (N, 3) LS解的ECEF坐标
@@ -319,7 +316,7 @@ def compute_error_statistics(ls_xyz, truth_xyz, ref_lat, ref_lon):
         'stats': stats
     }
 
-# 修改：增强的绘图函数，包含误差分析
+# 绘图函数，包含误差分析
 def generate_and_save_plots(results, out_path, truth_llh=None):
     valid = [r for r in results if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
     if len(valid) < 1:
@@ -338,7 +335,7 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
     R = ecef_to_enu_rotation(ref_lat, ref_lon)
     enu = (R @ (xyz - ref_xyz).T).T
 
-    # 真值（来自 NAV-PVT）
+    # 真值
     t_lon = t_lat = t_h = t_enu = None
     error_data = None
     if truth_llh is not None and len(truth_llh) >= 1:
@@ -407,7 +404,7 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
     ax.legend(); plt.tight_layout(); plt.savefig(plot3d, dpi=150); plt.show(); plt.close()
     print(f"Saved {plot2d} and {plot3d}.")
     
-    # 新增：误差分析图
+    # 误差分析图
     if error_data is not None:
         # 1. ENU误差时间序列
         plot_enu_err = prefix + "_error_enu_timeseries.png"
@@ -796,11 +793,11 @@ def main():
         error_data = compute_error_statistics(xyz, t_xyz, ref_lat, ref_lon)
     
     generate_and_save_plots(results, out_path, truth_llh=truth_llh)
-    
-    # 新增：打印统计表格
+
+    # 打印统计表格
     print_summary_table(results, error_data, truth_llh)
-    
-    # 新增：导出误差和DOP数据到CSV
+
+    # 导出误差和DOP数据到CSV
     error_dop_csv = out_path.rsplit('.', 1)[0] + '_error_dop.csv'
     save_error_and_dop_statistics(results, error_data, error_dop_csv)
 
