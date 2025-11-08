@@ -135,7 +135,7 @@ def compute_dops(H, lat_deg, lon_deg):
 
 # 新增：将经纬高序列写出为 KML（LineString）
 def save_kml_with_truth(ls_lon_lat_h, truth_lon_lat_h, path,
-                        name_ls="LS SPP Solution", name_truth="Truth (NAV-PVT)"):
+                        name_ls="LS SPP Solution", name_truth="Truth (NAV-ECEF)"):
     """
     ls_lon_lat_h       : [(lon_deg, lat_deg, h_m), ...]
     truth_lon_lat_h    : [(lon_deg, lat_deg, h_m), ...] 或 None
@@ -353,7 +353,7 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
         # 计算误差统计
         error_data = compute_error_statistics(xyz, t_xyz, ref_lat, ref_lon)
         
-        print(f"[Plot] LS points: {len(lats)}, Truth(NAV-PVT) points: {len(t_lon)} (aligned by index).")
+        print(f"[Plot] LS points: {len(lats)}, Truth(NAV-ECEF) points: {len(t_lon)} (aligned by index).")
         if error_data['stats']:
             st = error_data['stats']
             print(f"[Error Stats]")
@@ -549,7 +549,7 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
 #             head_line = line
 #             break
 #     delim = ',' if (',' in head_line) else None  # None=按空白分隔
-# 
+
 #     # 尝试带表头读取
 #     try:
 #         data = np.genfromtxt(path, delimiter=delim, names=True, dtype=None, encoding=None)
@@ -566,13 +566,13 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
 #         # 兜底：无表头，取前三列
 #         arr = np.genfromtxt(path, delimiter=delim, ndmin=2)
 #         lon, lat, h = arr[:, 0].astype(float), arr[:, 1].astype(float), arr[:, 2].astype(float)
-# 
+
 #     # 单位自动识别与换算
 #     # if np.nanmedian(np.abs(lon)) > 400.0: lon *= 1e-7  # 1e-7 度 → 度
 #     # if np.nanmedian(np.abs(lat)) > 100.0: lat *= 1e-7
 #     # 高度：若绝对值中位数 > 10000，视为毫米 → 米（例如 16737 → 16.737 m）
 #     if np.nanmedian(np.abs(h)) > 1.0e4:   h   *= 1e-3
-# 
+
 #     return np.column_stack([lon, lat, h])
 
 
@@ -619,12 +619,12 @@ def load_truth_from_nav_hpposecef(path):
         ecef_y = arr[:, 1].astype(float)
         ecef_z = arr[:, 2].astype(float)
 
-    # # 单位转换：NAV-HPPOSECEF 通常以厘米为单位，转换为米
-    # # 如果数值很大（>1e6），说明单位是厘米
+    # 单位转换：NAV-HPPOSECEF 通常以厘米为单位，转换为米
+    # 如果数值很大（>1e6），说明单位是厘米
     # if np.nanmedian(np.abs(ecef_x)) > 1e6:
-    #     ecef_x *= 0.01  # cm -> m
-    #     ecef_y *= 0.01
-    #     ecef_z *= 0.01
+    ecef_x *= 0.01  # cm -> m
+    ecef_y *= 0.01
+    ecef_z *= 0.01
 
     # 转换 ECEF 到 LLH
     n = len(ecef_x)
@@ -822,7 +822,7 @@ def main():
     np.savetxt(out_path, out, delimiter=",", header=header, comments="", fmt="%.10f")
     print(f"Saved {out_path} with {out.shape[0]} epochs.")
 
-    # 读取真值：从 NAV-HPPOSECEF.csv (ECEF 数据)
+    # # 读取真值：从 NAV-HPPOSECEF.csv (ECEF 数据)
     try:
         truth_llh = load_truth_from_nav_hpposecef(hpposecef_truth_path)
         print(f"[Truth HPPOSECEF] shape: {truth_llh.shape}  "

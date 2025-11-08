@@ -5,8 +5,8 @@ close all;
 addpath( fullfile('matRTKLIB') )
 
 %% Read RINEX observation/navigation file
-obs = gt.Gobs(fullfile('rinex_data/coliseum.obs'));
-nav = gt.Gnav(fullfile('rinex_data/coliseum.nav'));
+obs = gt.Gobs(fullfile('rinex_data/blockx.obs'));
+nav = gt.Gnav(fullfile('rinex_data/blockx.nav'));
 obs.plot;
 obs.plotNSat;
 obs.plotSky(nav);
