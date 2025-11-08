@@ -524,15 +524,67 @@ def generate_and_save_plots(results, out_path, truth_llh=None):
             print(f"Saved {plot_stats}.")
 
 
-def load_truth_llh_from_nav_pvt(path):
+# ============================================================================
+# 真值数据加载函数
+# ============================================================================
+
+# 注释：原 NAV-PVT 加载函数（保留以备将来使用）
+# def load_truth_llh_from_nav_pvt(path):
+#     """
+#     读取 UBX NAV-PVT：
+#       - 支持逗号或空白分隔、有/无表头
+#       - 列优先使用: lon, lat, height（无 height 时回退 hMSL）
+#       - 自动把 1e-7 度 → 度；毫米 → 米
+#     返回: (N,3)  [lon_deg, lat_deg, h_m]
+#     """
+#     # 先判定分隔符
+#     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+#         head_line = ""
+#         for _ in range(100):
+#             line = f.readline()
+#             if not line:
+#                 break
+#             if line.strip() == "" or line.lstrip().startswith("#"):
+#                 continue
+#             head_line = line
+#             break
+#     delim = ',' if (',' in head_line) else None  # None=按空白分隔
+# 
+#     # 尝试带表头读取
+#     try:
+#         data = np.genfromtxt(path, delimiter=delim, names=True, dtype=None, encoding=None)
+#         names = set(data.dtype.names or [])
+#         if 'lon' in names and 'lat' in names:
+#             lon = np.asarray(data['lon'], float)
+#             lat = np.asarray(data['lat'], float)
+#             if   'height' in names: h = np.asarray(data['height'], float)
+#             elif 'hMSL'   in names: h = np.asarray(data['hMSL'],   float)
+#             else:                   h = np.zeros_like(lon)
+#         else:
+#             raise ValueError("no named columns lon/lat")
+#     except Exception:
+#         # 兜底：无表头，取前三列
+#         arr = np.genfromtxt(path, delimiter=delim, ndmin=2)
+#         lon, lat, h = arr[:, 0].astype(float), arr[:, 1].astype(float), arr[:, 2].astype(float)
+# 
+#     # 单位自动识别与换算
+#     # if np.nanmedian(np.abs(lon)) > 400.0: lon *= 1e-7  # 1e-7 度 → 度
+#     # if np.nanmedian(np.abs(lat)) > 100.0: lat *= 1e-7
+#     # 高度：若绝对值中位数 > 10000，视为毫米 → 米（例如 16737 → 16.737 m）
+#     if np.nanmedian(np.abs(h)) > 1.0e4:   h   *= 1e-3
+# 
+#     return np.column_stack([lon, lat, h])
+
+
+def load_truth_from_nav_hpposecef(path):
     """
-    读取 UBX NAV-PVT：
+    读取 UBX NAV-HPPOSECEF.csv：
       - 支持逗号或空白分隔、有/无表头
-      - 列优先使用: lon, lat, height（无 height 时回退 hMSL）
-      - 自动把 1e-7 度 → 度；毫米 → 米
+      - 读取列: ecefX, ecefY, ecefZ (ECEF坐标，单位：厘米)
+      - 将 ECEF 坐标转换为 LLH (经纬高)
     返回: (N,3)  [lon_deg, lat_deg, h_m]
     """
-    # 先判定分隔符
+    # 判定分隔符
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         head_line = ""
         for _ in range(100):
@@ -549,26 +601,45 @@ def load_truth_llh_from_nav_pvt(path):
     try:
         data = np.genfromtxt(path, delimiter=delim, names=True, dtype=None, encoding=None)
         names = set(data.dtype.names or [])
-        if 'lon' in names and 'lat' in names:
-            lon = np.asarray(data['lon'], float)
-            lat = np.asarray(data['lat'], float)
-            if   'height' in names: h = np.asarray(data['height'], float)
-            elif 'hMSL'   in names: h = np.asarray(data['hMSL'],   float)
-            else:                   h = np.zeros_like(lon)
+        
+        # 检查是否有 ecefX, ecefY, ecefZ 列
+        if 'ecefX' in names and 'ecefY' in names and 'ecefZ' in names:
+            ecef_x = np.asarray(data['ecefX'], float)
+            ecef_y = np.asarray(data['ecefY'], float)
+            ecef_z = np.asarray(data['ecefZ'], float)
         else:
-            raise ValueError("no named columns lon/lat")
-    except Exception:
-        # 兜底：无表头，取前三列
+            raise ValueError("NAV-HPPOSECEF.csv must contain ecefX, ecefY, ecefZ columns")
+    except Exception as e:
+        # 兜底：无表头，假设前三列为 ecefX, ecefY, ecefZ
+        print(f"[Warning] Failed to read with header: {e}. Trying without header...")
         arr = np.genfromtxt(path, delimiter=delim, ndmin=2)
-        lon, lat, h = arr[:, 0].astype(float), arr[:, 1].astype(float), arr[:, 2].astype(float)
+        if arr.shape[1] < 3:
+            raise ValueError("NAV-HPPOSECEF.csv must have at least 3 columns")
+        ecef_x = arr[:, 0].astype(float)
+        ecef_y = arr[:, 1].astype(float)
+        ecef_z = arr[:, 2].astype(float)
 
-    # 单位自动识别与换算
-    # if np.nanmedian(np.abs(lon)) > 400.0: lon *= 1e-7  # 1e-7 度 → 度
-    # if np.nanmedian(np.abs(lat)) > 100.0: lat *= 1e-7
-    # 高度：若绝对值中位数 > 10000，视为毫米 → 米（例如 16737 → 16.737 m）
-    if np.nanmedian(np.abs(h)) > 1.0e4:   h   *= 1e-3
+    # # 单位转换：NAV-HPPOSECEF 通常以厘米为单位，转换为米
+    # # 如果数值很大（>1e6），说明单位是厘米
+    # if np.nanmedian(np.abs(ecef_x)) > 1e6:
+    #     ecef_x *= 0.01  # cm -> m
+    #     ecef_y *= 0.01
+    #     ecef_z *= 0.01
 
-    return np.column_stack([lon, lat, h])
+    # 转换 ECEF 到 LLH
+    n = len(ecef_x)
+    llh_data = np.zeros((n, 3), dtype=float)
+    
+    for i in range(n):
+        if np.isfinite(ecef_x[i]) and np.isfinite(ecef_y[i]) and np.isfinite(ecef_z[i]):
+            lat, lon, h = ecef_to_lla(ecef_x[i], ecef_y[i], ecef_z[i])
+            llh_data[i, 0] = lon  # 经度
+            llh_data[i, 1] = lat  # 纬度
+            llh_data[i, 2] = h    # 高度
+        else:
+            llh_data[i, :] = np.nan
+
+    return llh_data
 
 
 def print_summary_table(results, error_data, truth_llh):
@@ -675,7 +746,12 @@ def main():
     sat_pos      = "/Users/jay/Documents/Bachelor/aae4203/rinex_data/satellite_positions.csv"
     out_path     = "/Users/jay/Documents/Bachelor/aae4203/Result/lse_solution.csv"
     kml_out      = "/Users/jay/Documents/Bachelor/aae4203/Result/lse_solution.kml"  # 基于 CSV 路径生成 KML
-    pvt_truth_path = "/Users/jay/Documents/Bachelor/aae4203/ubx-message/data/NAV-PVT.csv"  # 真值 PVT 文件路径
+    
+    # 真值文件路径：使用 NAV-HPPOSECEF.csv（ECEF坐标）
+    hpposecef_truth_path = "/Users/jay/Documents/Bachelor/aae4203/ubx-message/data/NAV-HPPOSECEF.csv"
+    
+    # 注释：原 NAV-PVT 真值路径（保留以备将来使用）
+    # pvt_truth_path = "/Users/jay/Documents/Bachelor/aae4203/ubx-message/data/NAV-PVT.csv"
 
     # 可选初值（如果需要），否则置 None
     llh0 = None  # e.g. "22.304139 114.180131 -20.2" -> set below if needed
@@ -746,16 +822,27 @@ def main():
     np.savetxt(out_path, out, delimiter=",", header=header, comments="", fmt="%.10f")
     print(f"Saved {out_path} with {out.shape[0]} epochs.")
 
-    # 读取真值 PVT
+    # 读取真值：从 NAV-HPPOSECEF.csv (ECEF 数据)
     try:
-        truth_llh = load_truth_llh_from_nav_pvt(pvt_truth_path)
-        print(f"[Truth PVT] shape: {truth_llh.shape}  "
+        truth_llh = load_truth_from_nav_hpposecef(hpposecef_truth_path)
+        print(f"[Truth HPPOSECEF] shape: {truth_llh.shape}  "
               f"lon[{np.nanmin(truth_llh[:,0]):.6f},{np.nanmax(truth_llh[:,0]):.6f}]  "
               f"lat[{np.nanmin(truth_llh[:,1]):.6f},{np.nanmax(truth_llh[:,1]):.6f}]  "
               f"h[{np.nanmin(truth_llh[:,2]):.3f},{np.nanmax(truth_llh[:,2]):.3f}] m")
     except Exception as e:
-        print(f"[Truth PVT] load failed: {e}")
+        print(f"[Truth HPPOSECEF] load failed: {e}")
         truth_llh = None
+
+    # 注释：原 NAV-PVT 真值加载（保留以备将来使用）
+    # try:
+    #     truth_llh = load_truth_llh_from_nav_pvt(pvt_truth_path)
+    #     print(f"[Truth PVT] shape: {truth_llh.shape}  "
+    #           f"lon[{np.nanmin(truth_llh[:,0]):.6f},{np.nanmax(truth_llh[:,0]):.6f}]  "
+    #           f"lat[{np.nanmin(truth_llh[:,1]):.6f},{np.nanmax(truth_llh[:,1]):.6f}]  "
+    #           f"h[{np.nanmin(truth_llh[:,2]):.3f},{np.nanmax(truth_llh[:,2]):.3f}] m")
+    # except Exception as e:
+    #     print(f"[Truth PVT] load failed: {e}")
+    #     truth_llh = None
 
     ls_coords = [(r[5], r[4], r[6]) for r in results  # (lon, lat, h)
                 if np.isfinite(r[4]) and np.isfinite(r[5]) and np.isfinite(r[6])]
@@ -766,7 +853,7 @@ def main():
 
     if ls_coords or truth_coords:
         save_kml_with_truth(ls_coords, truth_coords, kml_out,
-                            name_ls="LS SPP Solution", name_truth="Truth (NAV-PVT)")
+                            name_ls="LS SPP Solution", name_truth="Truth (HPPOSECEF)")
         print(f"Saved {kml_out} with LS {len(ls_coords)} pts"
             f"{'' if truth_coords is None else f' and Truth {len(truth_coords)} pts'}.")
 
