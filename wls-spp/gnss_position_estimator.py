@@ -25,10 +25,10 @@ WGS84_F = 1.0/298.257223563
 WGS84_E2 = WGS84_F * (2.0 - WGS84_F)  # first eccentricity squared
 
 C = 299792458.0  # m/s, speed of light (not directly used since clk bias is in meters)
-# 新增：地球自转角速度
+# 地球自转角速度
 OMEGA_E = 7.2921151467e-5  # rad/s
 
-# 新增：地球自转改正函数（Sagnac）
+# 地球自转改正函数（Sagnac）
 def correct_for_earth_rotation(S, xr):
     """
     根据当前接收机位置 xr 对卫星坐标 S 进行地球自转改正。
