@@ -150,12 +150,11 @@ for epoch = 1:num_epochs
 end
 
 % Write the matrices to CSV files
-writematrix(pseudoranges_meas_mat, 'pseudoranges_meas.csv');
-writematrix(satellite_clock_bias_mat, 'satellite_clock_bias.csv');
-writematrix(ionospheric_delay_mat, 'ionospheric_delay.csv');
-writematrix(tropospheric_delay_mat, 'tropospheric_delay.csv');
-writematrix(satellite_positions_mat, 'satellite_positions.csv');
-
+writematrix(pseudoranges_meas_mat, 'rinex_data/pseudoranges_meas.csv');
+writematrix(satellite_clock_bias_mat, 'rinex_data/satellite_clock_bias.csv');
+writematrix(ionospheric_delay_mat, 'rinex_data/ionospheric_delay.csv');
+writematrix(tropospheric_delay_mat, 'rinex_data/tropospheric_delay.csv');
+writematrix(satellite_positions_mat, 'rinex_data/satellite_positions.csv');
 %% Convert ECEF positions to LLH
 xlog_llh = ecef2lla(xlog(:,1:3), 'WGS84'); % [lat, lon, height] in degrees and meters
 

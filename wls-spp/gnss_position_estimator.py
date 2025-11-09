@@ -25,6 +25,30 @@ WGS84_F = 1.0/298.257223563
 WGS84_E2 = WGS84_F * (2.0 - WGS84_F)  # first eccentricity squared
 
 C = 299792458.0  # m/s, speed of light (not directly used since clk bias is in meters)
+# 新增：地球自转角速度
+OMEGA_E = 7.2921151467e-5  # rad/s
+
+# 新增：地球自转改正函数（Sagnac）
+def correct_for_earth_rotation(S, xr):
+    """
+    根据当前接收机位置 xr 对卫星坐标 S 进行地球自转改正。
+    返回:
+        S_corr: 修正后的卫星坐标 (n,3)
+        rho0  : 未改正前几何距离 (n,)
+        tau   : 传播时间估计 (n,)
+    """
+    diff0 = S - xr
+    rho0 = np.linalg.norm(diff0, axis=1)
+    tau = rho0 / C
+    S_corr = S.copy()
+    for i, ang in enumerate(OMEGA_E * tau):
+        ca = math.cos(ang); sa = math.sin(ang)
+        # 旋转矩阵 R3(+ωτ)（将卫星从接收时刻旋回发射时刻参考系）
+        R3 = np.array([[ ca,  sa, 0],
+                       [-sa,  ca, 0],
+                       [  0,   0, 1]], dtype=float)
+        S_corr[i] = R3 @ S[i]
+    return S_corr, rho0, tau
 
 def load_csv(path):
     # Robustly load with NaNs; allow empty lines
@@ -187,11 +211,12 @@ def save_kml_with_truth(ls_lon_lat_h, truth_lon_lat_h, path,
         f.write("\n".join(lines))
 
 
-def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4):
+def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4, earth_rotation=True):
     """
     p_corr: (m,) corrected pseudoranges (P + clk_s - ion - trop)
-    sat_pos: (m,3) satellite ECEF positions
+    sat_pos: (m,3) satellite ECEF positions (接收历元)
     x0: initial state [x,y,z,cbias(m)] or None -> start at Earth center
+    earth_rotation: 是否应用地球自转(Sagnac)改正（旋转卫星坐标）
     Returns: (x,y,z,cbias_m), H_at_solution, used_sat_count, success(bool)
     """
     # Valid satellites: need positions & pseudorange both finite
@@ -214,16 +239,19 @@ def solve_epoch_ls(p_corr, sat_pos, x0=None, max_iter=20, tol=1e-4):
     H_last = None
 
     for _ in range(max_iter):
-        # geometric ranges and LOS
-        diff = S - xr  # sat - rec
+        # 几何距离及地球自转改正
+        if earth_rotation:
+            S_iter, rho_pre, tau = correct_for_earth_rotation(S, xr)
+        else:
+            S_iter = S
+        diff = S_iter - xr
         rho = np.linalg.norm(diff, axis=1)
-        # unit vectors from receiver to satellite:
-        # u = (xr - xs)/rho = -(xs - xr)/rho
-        u = (xr[None, :] - S) / rho[:, None]
+        # 单位方向向量（从接收机指向卫星）
+        u = (xr[None, :] - S_iter) / rho[:, None]
 
         # predicted pseudorange = rho + cb
         pred = rho + cb
-        v = P - pred  # residuals
+        v = P - pred
 
         # Build H (n x 4)
         H = np.zeros((idx.size, 4), dtype=float)
@@ -794,7 +822,7 @@ def main():
         S_k = sat_per_epoch[k]  # (Smax,3)
 
         sol, H, ns, ok = solve_epoch_ls(
-            P_corr, S_k, x0=x0, max_iter=max_iter, tol=tol
+            P_corr, S_k, x0=x0, max_iter=max_iter, tol=tol, earth_rotation=True
         )
 
         if (not ok) or (sol is None):
