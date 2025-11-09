@@ -32,6 +32,13 @@ ionospheric_delay_cell = cell(num_epochs, 1); %
 tropospheric_delay_cell = cell(num_epochs, 1); % 
 doppler_meas_cell = cell(num_epochs, 1); % 
 
+%% 新增: 初始化DOP数组
+GDOP = nan(num_epochs,1);
+PDOP = nan(num_epochs,1);
+HDOP = nan(num_epochs,1);
+VDOP = nan(num_epochs,1);
+TDOP = nan(num_epochs,1);
+
 %% Loop over all epochs
 %% Point positioning
 
@@ -72,6 +79,18 @@ for epoch = 1:num_epochs
 
         % Exit loop after convergence 
         if norm(dx)<1e-3
+            % 收敛后计算DOP
+            if nobs >= 4
+                W = diag(w);                % 权矩阵
+                Q = inv(H' * W * H);        % 参数协方差(未乘测量噪声方差因子)
+                % 提取
+                Qxx = Q(1,1); Qyy = Q(2,2); Qzz = Q(3,3); Qtt = Q(4,4);
+                GDOP(epoch) = sqrt(trace(Q));
+                PDOP(epoch) = sqrt(Qxx + Qyy + Qzz);
+                HDOP(epoch) = sqrt(Qxx + Qyy);
+                VDOP(epoch) = sqrt(Qzz);
+                TDOP(epoch) = sqrt(Qtt);
+            end
             break;
         end
     end
@@ -163,6 +182,21 @@ posest = gt.Gpos(xlog(:,1:3),'xyz');
 posest.setOrg(llhref,"llh");
 posest.plot;
 title('LSE Trajectory');
+
+%% 新增: 绘制DOP曲线
+figure('Name','DOP指标','NumberTitle','off');
+ep = (1:num_epochs)';
+plot(ep, PDOP,'-o','MarkerSize',4); hold on;
+plot(ep, HDOP,'-s','MarkerSize',4);
+plot(ep, VDOP,'-d','MarkerSize',4);
+plot(ep, TDOP,'-^','MarkerSize',4);
+plot(ep, GDOP,'-v','MarkerSize',4);
+grid on;
+xlabel('历元');
+ylabel('DOP值');
+legend({'PDOP','HDOP','VDOP','TDOP','GDOP'},'Location','best');
+title('GNSS DOP 随历元变化');
+% 可根据需要添加: writematrix([ep PDOP HDOP VDOP TDOP GDOP],'rinex_data/dop.csv');
 
 % %% RTKLIB spp solution
 % opt=gt.Gopt("spp.conf");
